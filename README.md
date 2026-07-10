@@ -1,7 +1,7 @@
 # CodeMind — AI Repo Analyzer
 
 Log in with GitHub, pick a repo, get back a multi-section report — architecture,
-security, dependencies, code quality, docs — with Mermaid diagrams generated
+security, dependencies, code quality, docs — with D2 diagrams generated
 from real code relationships, exportable as Markdown or PDF.
 
 Portfolio project. The point isn't the report; it's the plumbing: a
@@ -32,7 +32,7 @@ files at the model.
                            │ Redis pub/sub: job:*:ready_for_synthesis
                            ▼
                     ┌──────────────┐
-                    │ synthesizer  │  1 Sonnet call, Mermaid builder,
+                    │ synthesizer  │  1 Sonnet call, D2 -> SVG (WASM),
                     │              │  Markdown renderer
                     └──────────────┘
 
@@ -62,15 +62,16 @@ monolith" and "five services nobody needed to split."
    below), checks the Redis context cache, calls Haiku with a strict JSON
    schema, writes to `agent_results`, and tracks completion in Redis.
 6. Once every dispatched agent has finished, `synthesizer` pulls all agent
-   results, builds six Mermaid diagrams programmatically (zero LLM calls),
-   makes one Sonnet call for cross-agent reasoning, renders the Markdown
-   report, and persists it.
+   results, makes one Sonnet call for cross-agent reasoning, then builds six
+   diagrams programmatically and renders each to SVG server-side (zero LLM
+   calls), renders the Markdown report, and persists both.
 7. Socket.io relays `job:status` / `job:progress` / `job:complete` /
    `job:failed` events to the browser — job lifecycle only, never raw agent
    reasoning.
-8. `GET /jobs/:id/export?format=md|pdf` serves the stored report; PDF export
-   converts Mermaid fences to Mermaid.js-rendered `<div>`s and renders via
-   Puppeteer at request time (not pre-generated per job).
+8. `GET /jobs/:id/export?format=md|pdf` serves the stored report. The stored
+   Markdown carries each diagram's *source* in a ```` ```d2 <slug> ```` fence;
+   PDF export swaps those for the already-rendered SVG and prints via Puppeteer
+   at request time (not pre-generated per job). No CDN, no client-side JS.
 
 ## Why these choices
 
@@ -97,12 +98,28 @@ and gets back only the relevant nodes, sorted by centrality — not "here's
 (truncate by centrality, never by raw line count), and the outcome is
 measurable: `tokens_used` is logged per agent run in Postgres, not asserted.
 
-**Why Mermaid diagrams are built in plain TypeScript, not by the LLM.** The
-six diagram builders (`mermaid.builder.ts`) map agent JSON straight to
-Mermaid syntax. The LLM never writes diagram syntax. That's the answer to "how
-do you know the diagrams are accurate" — they can't hallucinate a dependency
-edge that isn't in the agent's structured output, because there's no
-generation step between the graph data and the diagram.
+**Why diagrams are built in plain TypeScript, not by the LLM.** The diagram
+builders (`apps/synthesizer/src/diagrams/`) map agent JSON straight to D2
+source. The LLM never writes diagram syntax. That's the answer to "how do you
+know the diagrams are accurate" — they can't hallucinate a dependency edge that
+isn't in the agent's structured output, because there's no generation step
+between the graph data and the diagram.
+
+**Why D2 instead of Mermaid.** Mermaid only renders inside a browser. That
+forced the PDF exporter to inject `mermaid.esm.min.mjs` from a CDN and hope
+Puppeteer executed it before capturing the page — a race that fails *silently*,
+emitting raw code blocks whenever the CDN is slow or blocked. D2 renders to SVG
+server-side (Go/WASM, no browser), once, at report-build time. The result is
+inert markup: the PDF exporter and the frontend both just embed a string, and
+neither needs a diagram library or network access. Diagrams also carry their
+own `prefers-color-scheme` CSS, so one stored SVG serves light mode, dark mode
+and print.
+
+Two of the six visuals — the technical-debt donut and the health gauge — are
+hand-built SVG rather than D2, because D2 is a diagram language and has no
+chart primitives. Risk is always encoded as a text prefix (`[CRITICAL]`,
+`NEEDS ATTENTION`) *in addition to* colour, so the diagrams survive greyscale
+printing and colourblind readers; the palette is Okabe-Ito derived.
 
 **Why hand-rolled orchestration, not LangChain/CrewAI.** The five analysis
 subtasks are independent, not a sequential ReAct loop with feedback — a
@@ -117,7 +134,7 @@ apps/
   api-gateway/     GitHub OAuth, repo listing, trigger endpoint, report/export, Socket.io gateway
   orchestrator/    RabbitMQ consumer: tarball download, CodeGraph index, agent dispatch
   agent-worker/    5 queue consumers (1 process): architecture/security/dependency/quality/docs
-  synthesizer/     Completion tracking, 1 Sonnet call, Mermaid + Markdown rendering
+  synthesizer/     Completion tracking, 1 Sonnet call, D2/SVG + Markdown rendering
 libs/common/       Prisma service, Redis/RabbitMQ topology constants, Redis config, crypto
 prisma/            schema.prisma (source of truth for the DB) + generated migrations
 ```
@@ -176,7 +193,7 @@ events for Socket.io are relayed the same way, via `job:{id}:events`.
 
 - [x] Phase 1 — infra, GitHub OAuth, trigger → queue → dummy consumer loop
 - [x] Phase 2 — tarball download, CodeGraph indexing, manifest-based agent dispatch
-- [x] Phase 3 (backend) — all 5 agents, synthesizer, Mermaid builder, report renderer
+- [x] Phase 3 (backend) — all 5 agents, synthesizer, D2 diagram builders, report renderer
 - [ ] Phase 3 (frontend) — Next.js UI (connect → pick repo → trigger → live status → report)
 - [x] Phase 4 — PDF export, repo size/file-count guardrails, per-job token budget cap
 - [x] Containerized — Dockerfile per app, docker-compose wiring, Prisma migrations

@@ -11,32 +11,44 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { mdToPdf } from 'md-to-pdf';
+import { inlineDiagrams, RenderedDiagram } from '@app/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { JobsService } from './jobs.service';
 
 type ExportFormat = 'md' | 'pdf';
 
 /**
- * Mermaid.js pulled from a CDN and initialized client-side — md-to-pdf renders
- * via Puppeteer, so this script actually executes and diagrams rasterize
- * before the PDF is captured (they don't just show up as code blocks).
+ * Diagrams arrive here already rendered to SVG by the synthesizer, so the PDF
+ * path is a pure Markdown -> HTML -> print. There is no diagram script to load,
+ * nothing to execute, and no network access required.
+ *
+ * The Mermaid version of this file injected `mermaid.esm.min.mjs` from a CDN and
+ * relied on Puppeteer executing it before capture — which meant an export could
+ * silently emit raw code blocks whenever the CDN was slow, blocked, or the
+ * capture won the race. D2 renders server-side, so that entire class of failure
+ * is gone.
  */
-const MERMAID_SCRIPT = `
-<script type="module">
-  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-  mermaid.initialize({ startOnLoad: true, theme: 'default' });
-</script>
-<style>
-  .language-mermaid { background: transparent !important; }
-</style>
-`;
-
 const PDF_CSS = `
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
   pre { background: #f5f5f5; padding: 1em; border-radius: 4px; }
   table { border-collapse: collapse; width: 100%; }
   td, th { border: 1px solid #ddd; padding: 8px; }
   th { background: #f2f2f2; }
+
+  /* Keep a diagram and its caption on one page, and never let a wide graph
+     overflow the paper — Puppeteer will not scroll for us. */
+  figure.cm-diagram {
+    margin: 1.5em 0;
+    page-break-inside: avoid;
+    break-inside: avoid;
+    text-align: center;
+  }
+  figure.cm-diagram svg { max-width: 100%; height: auto; }
+  figure.cm-diagram figcaption {
+    margin-top: 0.5em;
+    font-size: 0.85em;
+    color: #5A5A5A;
+  }
 `;
 
 @Controller('jobs/:jobId/export')
@@ -62,8 +74,11 @@ export class ExportController {
 
     if (format === 'pdf') {
       try {
+        const diagrams = report.diagrams as unknown as RenderedDiagram[];
+        const html = inlineDiagrams(report.markdownContent, diagrams ?? []);
+
         const pdf = await mdToPdf(
-          { content: this.injectMermaid(report.markdownContent) },
+          { content: html },
           {
             launch_options: {
               args: ['--no-sandbox', '--disable-setuid-sandbox'],
@@ -96,20 +111,14 @@ export class ExportController {
       }
     }
 
+    // `.md` ships the diagram *sources*, not the SVGs: a Markdown file with a
+    // readable ```d2 block round-trips through any editor, a 20KB inlined SVG
+    // does not.
     res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
     res.setHeader(
       'Content-Disposition',
       `attachment; filename="report-${jobId}.md"`,
     );
     res.send(report.markdownContent);
-  }
-
-  /** Replace ```mermaid fences with <div class="mermaid"> so Mermaid.js picks them up. */
-  private injectMermaid(markdown: string): string {
-    const withDivs = markdown.replace(
-      /```mermaid\n([\s\S]*?)```/g,
-      (_match, code: string) => `<div class="mermaid">\n${code}\n</div>`,
-    );
-    return withDivs + '\n\n' + MERMAID_SCRIPT;
   }
 }

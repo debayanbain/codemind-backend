@@ -1,27 +1,23 @@
 import { Injectable } from '@nestjs/common';
-import { AgentOutputsByType, SonnetSynthesisOutput } from '@app/common';
-import { MermaidBuilder } from '../mermaid/mermaid.builder';
+import {
+  AgentOutputsByType,
+  RenderedDiagram,
+  SonnetSynthesisOutput,
+} from '@app/common';
 
 interface RenderInput {
   jobId: string;
   agentOutputs: AgentOutputsByType;
-  diagrams: {
-    architectureGraph: string;
-    requestFlow: Array<{ name: string; mermaid: string }>;
-    securityFlow: string;
-    dependencyGraph: string;
-    qualityPie: string;
-  };
+  diagrams: RenderedDiagram[];
   synthesis: SonnetSynthesisOutput;
   totalTokens: number;
 }
 
 @Injectable()
 export class ReportRenderer {
-  constructor(private readonly mermaid: MermaidBuilder) {}
-
   render(input: RenderInput): string {
-    const { agentOutputs: o, diagrams: d, synthesis: s, totalTokens } = input;
+    const { agentOutputs: o, diagrams, synthesis: s, totalTokens } = input;
+    const d = new DiagramFences(diagrams);
     const arch = o.architecture ?? {};
     const sec = o.security ?? {};
     const dep = o.dependency ?? {};
@@ -57,9 +53,7 @@ export class ReportRenderer {
     const healthEmoji = score >= 80 ? '🟢' : score >= 60 ? '🟡' : '🔴';
     sections.push(`## ${healthEmoji} Overall Health: ${score}/100
 
-\`\`\`mermaid
-${this.mermaid.healthGauge(score)}
-\`\`\`
+${d.fence('health-gauge')}
 `);
 
     // ─── Executive Summary ─────────────────────────────────────────────────────
@@ -77,20 +71,17 @@ ${arch.summary ?? ''}
 
 ### Module Dependency Graph
 
-\`\`\`mermaid
-${d.architectureGraph}
-\`\`\`
+${d.fence('architecture-modules')}
 `);
 
-    if (d.requestFlow.length > 0) {
+    const requestFlows = d.matching(/^request-flow-\d+$/);
+    if (requestFlows.length > 0) {
       sections.push(`### Request Flows
 `);
-      d.requestFlow.forEach(({ name, mermaid: m }) => {
-        sections.push(`#### ${name}
+      requestFlows.forEach((flow) => {
+        sections.push(`#### ${flow.title}
 
-\`\`\`mermaid
-${m}
-\`\`\`
+${d.fence(flow.slug)}
 `);
       });
     }
@@ -111,9 +102,7 @@ ${sec.summary ?? ''}
 
 ### Authentication Flow
 
-\`\`\`mermaid
-${d.securityFlow}
-\`\`\`
+${d.fence('security-auth-flow')}
 `);
 
     if (sensitiveEndpoints.length > 0) {
@@ -154,11 +143,10 @@ ${missingProtections.map((p) => `- ❌ ${p}`).join('\n')}
 
 ### Dependency Graph
 
-> 🟠 Orange = Critical | 🔴 Red = Critical + Outdated | 🟡 Yellow = Outdated Risk
+> Packages are tagged \`[CRITICAL]\` and/or \`[OUTDATED]\` in their label — the
+> colour repeats that, it never carries it alone.
 
-\`\`\`mermaid
-${d.dependencyGraph}
-\`\`\`
+${d.fence('dependency-graph')}
 `);
 
     if (outdatedRisks.length > 0) {
@@ -188,9 +176,7 @@ ${licenseConcerns.map((c) => `- ⚠️ ${c}`).join('\n')}
 
 ### Technical Debt Distribution
 
-\`\`\`mermaid
-${d.qualityPie}
-\`\`\`
+${d.fence('quality-donut')}
 `);
 
     if (complexityHotspots.length > 0) {
@@ -294,5 +280,38 @@ ${recommendations.map((r, i) => `${i + 1}. ${r}`).join('\n')}
       missing: '🔴 Missing',
     };
     return (quality && labels[quality]) ?? quality ?? 'Unknown';
+  }
+}
+
+/**
+ * Emits a diagram as a fenced block carrying its *source*, tagged with its slug:
+ *
+ * ```d2 architecture-modules
+ * direction: right
+ * m_api -> m_db
+ * ```
+ *
+ * The rendered SVG is not embedded in the Markdown. It's persisted alongside it
+ * and spliced in by `inlineDiagrams()` for HTML and PDF. Two reasons: a `.md`
+ * export stays a text document a human can read and diff (a 20KB base64 SVG
+ * blob is neither), and the source stays authoritative, so restyling every
+ * diagram never means re-running the agents.
+ */
+class DiagramFences {
+  private readonly bySlug: Map<string, RenderedDiagram>;
+
+  constructor(private readonly diagrams: RenderedDiagram[]) {
+    this.bySlug = new Map(diagrams.map((d) => [d.slug, d]));
+  }
+
+  matching(pattern: RegExp): RenderedDiagram[] {
+    return this.diagrams.filter((d) => pattern.test(d.slug));
+  }
+
+  fence(slug: string): string {
+    const diagram = this.bySlug.get(slug);
+    if (!diagram) return `> _Diagram unavailable: ${slug}_`;
+
+    return `\`\`\`${diagram.kind} ${diagram.slug}\n${diagram.source}\n\`\`\``;
   }
 }

@@ -53,6 +53,12 @@ COPY package.json package-lock.json ./
 COPY prisma ./prisma
 RUN npm ci --omit=dev
 
+# @terrastruct/d2 carries a ~22MB WASM binary (x2 — an ESM and a CJS copy) and
+# only the synthesizer ever renders a diagram. api-gateway inlines SVG the
+# synthesizer already produced, so it needs the strings, not the renderer.
+# Dropping it saves ~58MB on three of the four images.
+RUN if [ "$APP_NAME" != "synthesizer" ]; then rm -rf node_modules/@terrastruct; fi
+
 COPY --from=build /app/dist/apps/${APP_NAME} ./dist
 # nest build's outDir mirrors the full source path (apps/<app>/src/... +
 # libs/common/src/...) because each app's tsconfig also compiles the shared

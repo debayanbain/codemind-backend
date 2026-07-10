@@ -17,6 +17,11 @@ import {
   REFRESH_COOKIE_MAX_AGE,
 } from './auth.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
+import {
+  OAUTH_NEXT_COOKIE,
+  OauthNextGuard,
+  sanitizeNext,
+} from './oauth-next.guard';
 
 const ACCESS_COOKIE = 'access_token';
 const REFRESH_COOKIE = 'refresh_token';
@@ -28,8 +33,10 @@ export class AuthController {
     private readonly config: ConfigService,
   ) {}
 
+  // OauthNextGuard must precede AuthGuard — the latter redirects to GitHub and
+  // nothing after it runs.
   @Get('github')
-  @UseGuards(AuthGuard('github'))
+  @UseGuards(OauthNextGuard, AuthGuard('github'))
   githubLogin() {
     // Passport redirects to GitHub; body never executes.
   }
@@ -39,7 +46,18 @@ export class AuthController {
   githubCallback(@Req() req: Request, @Res() res: Response) {
     const user = req.user as User;
     this.setAuthCookies(res, user);
-    res.redirect(this.config.get<string>('FRONTEND_URL', 'http://localhost:3001'));
+
+    // Re-sanitize on the way out: the cookie is ours, but a redirect target is
+    // exactly the thing you don't trust twice.
+    const cookies = req.cookies as Record<string, string> | undefined;
+    const next = sanitizeNext(cookies?.[OAUTH_NEXT_COOKIE]);
+    res.clearCookie(OAUTH_NEXT_COOKIE, this.cookieBase());
+
+    const frontendUrl = this.config.get<string>(
+      'FRONTEND_URL',
+      'http://localhost:3001',
+    );
+    res.redirect(next ? `${frontendUrl}${next}` : frontendUrl);
   }
 
   /**

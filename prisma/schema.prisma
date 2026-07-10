@@ -44,7 +44,8 @@ model User {
   avatarUrl                  String?  @map("avatar_url")
   createdAt                  DateTime @default(now()) @map("created_at")
 
-  jobs Job[]
+  jobs   Job[]
+  shares ReportShare[]
 
   @@map("users")
 }
@@ -86,9 +87,44 @@ model Report {
   id              String   @id @default(uuid())
   jobId           String   @unique @map("job_id")
   markdownContent String   @map("markdown_content")
+  // RenderedDiagram[] — each diagram's source (D2 DSL / chart data JSON) plus
+  // the SVG the synthesizer rendered from it. Stored, not regenerated: the
+  // exporter and the frontend embed these strings directly, so neither needs a
+  // diagram renderer of its own. Defaulted so reports written before the D2
+  // migration still read back cleanly.
+  diagrams        Json     @default("[]")
+  // SonnetSynthesisOutput — executiveSummary, recommendations[],
+  // overallHealthScore. Also rendered into markdownContent, but persisted
+  // structurally so the dashboard reads numbers instead of scraping prose.
+  // Nullable: reports written before this column exist without it.
+  synthesis       Json?
+  totalTokens     Int      @default(0) @map("total_tokens")
   createdAt       DateTime @default(now()) @map("created_at")
 
-  job Job @relation(fields: [jobId], references: [id])
+  job    Job           @relation(fields: [jobId], references: [id])
+  shares ReportShare[]
 
   @@map("reports")
+}
+
+/**
+ * A view-only link to someone else's report. The token is the only capability —
+ * it must be unguessable (32 random bytes, base64url). Viewing still requires a
+ * CodeMind session: the token grants access to the report, not anonymity.
+ *
+ * Revocation is a timestamp, not a delete, so a revoked link stays traceable.
+ */
+model ReportShare {
+  id          String    @id @default(uuid())
+  reportId    String    @map("report_id")
+  token       String    @unique
+  createdById String    @map("created_by_id")
+  revokedAt   DateTime? @map("revoked_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  report    Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  createdBy User   @relation(fields: [createdById], references: [id])
+
+  @@index([reportId])
+  @@map("report_shares")
 }

@@ -8,18 +8,18 @@ import {
   AgentOutputsByType,
   SonnetSynthesisOutput,
   LlmClient,
+  Prisma,
   jobStatusKey,
   jobAgentsDoneKey,
   jobAgentsExpectedKey,
   jobEventsChannel,
   jobSynthesizingLockKey,
 } from '@app/common';
-import { MermaidBuilder } from '../mermaid/mermaid.builder';
+import { DiagramsService } from '../diagrams/diagrams.service';
 import { ReportRenderer } from '../report/report-renderer.service';
 
 const SONNET_MODEL = 'claude-sonnet-5';
-const OPENAI_SYNTHESIS_MODEL =
-  process.env.OPENAI_SYNTHESIS_MODEL ?? 'gpt-4o';
+const OPENAI_SYNTHESIS_MODEL = process.env.OPENAI_SYNTHESIS_MODEL ?? 'gpt-4o';
 
 @Injectable()
 export class SynthesizerService implements OnModuleInit {
@@ -30,7 +30,7 @@ export class SynthesizerService implements OnModuleInit {
   constructor(
     @InjectRedis() private readonly redis: Redis,
     private readonly prisma: PrismaService,
-    private readonly mermaid: MermaidBuilder,
+    private readonly diagrams: DiagramsService,
     private readonly renderer: ReportRenderer,
   ) {
     // Dedicated subscriber connection — a client used for pub/sub can't also issue commands.
@@ -82,26 +82,25 @@ export class SynthesizerService implements OnModuleInit {
         results.map((r) => [r.agentType, r.rawOutput]),
       ) as AgentOutputsByType;
 
-      const arch = byType.architecture ?? {};
-      const sec = byType.security ?? {};
-      const dep = byType.dependency ?? {};
-      const qual = byType.quality ?? {};
-
-      // 2. Build all Mermaid diagrams programmatically — ZERO LLM calls
-      const diagrams = {
-        architectureGraph: this.mermaid.moduleGraph(arch),
-        requestFlow: (arch.request_flows ?? []).map((f) => ({
-          name: f.name,
-          mermaid: this.mermaid.sequenceDiagram(f.steps),
-        })),
-        securityFlow: this.mermaid.securityFlow(sec),
-        dependencyGraph: this.mermaid.dependencyGraph(dep),
-        qualityPie: this.mermaid.qualityPie(qual),
-      };
-
-      // 3. ONE Sonnet call for executive summary + recommendations only.
+      // 2. ONE Sonnet call for executive summary + recommendations only.
       //    Agents already did the extraction — Sonnet does cross-agent reasoning.
       const synthesis = await this.callSonnet(byType);
+
+      // 3. Build every diagram from structured agent JSON and render each to
+      //    SVG — still ZERO LLM calls; D2 layout and the charts are pure code.
+      //    Runs after synthesis because the health gauge needs its score.
+      const diagrams = await this.diagrams.buildAll(
+        byType,
+        synthesis.overallHealthScore ?? 0,
+      );
+
+      const totalTokens = results.reduce((sum, r) => {
+        const tokens = r.tokensUsed as {
+          input?: number;
+          output?: number;
+        } | null;
+        return sum + (tokens?.input ?? 0) + (tokens?.output ?? 0);
+      }, 0);
 
       // 4. Render the full Markdown report
       const markdown = this.renderer.render({
@@ -109,18 +108,21 @@ export class SynthesizerService implements OnModuleInit {
         agentOutputs: byType,
         diagrams,
         synthesis,
-        totalTokens: results.reduce((sum, r) => {
-          const tokens = r.tokensUsed as {
-            input?: number;
-            output?: number;
-          } | null;
-          return sum + (tokens?.input ?? 0) + (tokens?.output ?? 0);
-        }, 0),
+        totalTokens,
       });
 
-      // 5. Persist
+      // 5. Persist. Markdown carries the diagram *sources*; the rendered SVGs
+      //    ride alongside so neither the exporter nor the frontend re-renders.
+      //    `synthesis` is stored structurally as well as prose-rendered — the
+      //    dashboard reads the health score as a number, not from the heading.
       await this.prisma.report.create({
-        data: { jobId, markdownContent: markdown },
+        data: {
+          jobId,
+          markdownContent: markdown,
+          diagrams: diagrams as unknown as Prisma.InputJsonValue,
+          synthesis: synthesis as unknown as Prisma.InputJsonValue,
+          totalTokens,
+        },
       });
       await this.prisma.job.update({
         where: { id: jobId },

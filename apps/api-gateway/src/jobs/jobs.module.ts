@@ -6,7 +6,9 @@ import { buildAnalysisQueueOptions } from '@app/common';
 import { AnalyzeController } from './analyze.controller';
 import { JobsController } from './jobs.controller';
 import { ExportController } from './export.controller';
+import { ShareController } from './share.controller';
 import { JobsService, ANALYSIS_QUEUE_CLIENT } from './jobs.service';
+import { ShareService } from './share.service';
 import { JobRateLimitGuard } from './job-rate-limit.guard';
 
 @Module({
@@ -20,7 +22,12 @@ import { JobRateLimitGuard } from './job-rate-limit.guard';
       },
     ]),
   ],
-  controllers: [AnalyzeController, JobsController, ExportController],
-  providers: [JobsService, JobRateLimitGuard],
+  controllers: [
+    AnalyzeController,
+    JobsController,
+    ExportController,
+    ShareController,
+  ],
+  providers: [JobsService, ShareService, JobRateLimitGuard],
 })
 export class JobsModule {}

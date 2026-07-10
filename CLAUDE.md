@@ -8,7 +8,7 @@
 
 A web platform where a user logs in with GitHub, selects a repo, and the system runs a
 multi-agent pipeline that analyzes the codebase and produces a report (architecture,
-security, dependencies, code quality, docs) with Mermaid diagrams, exportable as
+security, dependencies, code quality, docs) with D2 diagrams, exportable as
 `.md` or `.pdf`.
 
 This is a portfolio project for interviews. Priorities in order:
@@ -40,6 +40,7 @@ This is a portfolio project for interviews. Priorities in order:
 - **Realtime**: Socket.io (job status/progress only)
 - **Code graph**: `@colbymchenry/codegraph` (npm package, used programmatically — NOT the MCP server, NOT the CLI)
 - **LLM**: Anthropic API — Haiku for parallel extraction agents, Sonnet for the single synthesis call
+- **Diagrams**: `@terrastruct/d2` (npm package, used programmatically as a library — NOT the `d2` CLI). Rendered to SVG **server-side in the synthesizer**, never in the browser.
 - **PDF export**: `md-to-pdf` (Puppeteer under the hood)
 - **Frontend**: Next.js, minimal — one flow: connect GitHub → pick repo → trigger analysis → poll/see live status → view report → export
 
@@ -99,17 +100,19 @@ runtime dependencies and don't need independent scaling for this project's scale
    - Pulls all `agent_results` rows for the job.
    - One single Sonnet call: reasons across all agent outputs, produces an overall
      health score and any cross-cutting findings.
-   - Renders the final Markdown report (agent JSON -> Markdown sections -> Mermaid
-     diagrams built programmatically, see Section 8).
-   - Persists to `reports` table.
+   - Builds all six diagrams from the agent JSON and renders each to SVG (D2 via
+     WASM, plus two hand-built charts — see Section 9). Zero LLM calls. Runs
+     after the Sonnet call because the health gauge needs its score.
+   - Renders the final Markdown report (agent JSON -> Markdown sections ->
+     diagram fences carrying each diagram's source).
+   - Persists Markdown + rendered SVGs to `reports` table.
    - Updates job status to `done`, emits Socket.io `job:complete`.
 8. Frontend polls `GET /jobs/:id` (or listens on the socket) and renders the report.
-9. Export: `GET /jobs/:id/export?format=md|pdf`
-   - `.md` — serve the stored markdown string directly.
-   - `.pdf` — at request time, replace ` ```mermaid ` fences with `<div class="mermaid">`
-     tags, inject Mermaid.js via CDN into an HTML wrapper, render with `md-to-pdf`
-     (Puppeteer executes the injected JS before capture, so diagrams actually render,
-     not just show as code blocks). Do not pre-generate PDFs for every job.
+   The response carries `report.markdownContent` + `report.diagrams[]`; the frontend
+   splices the SVGs in with the same `inlineDiagrams()` helper the exporter uses.
+   **No diagram library runs client-side** — the browser only embeds strings.
+9. Export: `GET /jobs/:id/export?format=md|pdf` (see Section 10). Do not
+   pre-generate PDFs for every job.
 
 ## 6. Redis key schema (implement exactly this, don't invent your own naming)
 
@@ -128,7 +131,7 @@ runtime dependencies and don't need independent scaling for this project's scale
 users(id, github_id, github_access_token_encrypted, created_at)
 jobs(id, user_id, repo_full_name, status, created_at, completed_at)
 agent_results(id, job_id, agent_type, raw_output jsonb, tokens_used, status, created_at)
-reports(id, job_id, markdown_content, created_at)
+reports(id, job_id, markdown_content, diagrams jsonb, created_at)
 ```
 
 Token usage per agent run is mandatory, not optional — this is your answer to "how do
@@ -153,33 +156,94 @@ raw line count.
 Model routing: Haiku for architecture/security/quality/docs agents. Dependency agent:
 prefer zero-LLM parsing. Synthesis: exactly one Sonnet call, never more.
 
-## 9. Mermaid diagram generation — must be data-driven, not LLM-generated
+## 9. D2 diagram generation — must be data-driven, not LLM-generated
 
-Build a `mermaid.builder.ts` module that is pure TypeScript — it maps agent JSON
-output to Mermaid syntax. The LLM never writes Mermaid syntax directly. This is
-important: it's how you guarantee diagrams reflect real code relationships instead
-of hallucinated ones, and it's the answer to "how do you know the diagrams are
-accurate" in interview.
+The LLM never writes diagram syntax. Pure-TypeScript builders map agent JSON to
+D2 source, which is then rendered to SVG. This is how you guarantee diagrams
+reflect real code relationships instead of hallucinated ones, and it's the answer
+to "how do you know the diagrams are accurate" in interview.
 
-Six diagrams, one function each:
-1. `moduleGraph()` — from architecture agent's `module_dependencies[]`
-2. `sequenceDiagram()` — from architecture agent's `request_flows[].steps[]`
-3. `securityFlow()` — from security agent's `auth_flow_steps[]` + `vulnerabilities[]`
-4. `dependencyGraph()` — from dependency agent's runtime deps, flag critical/outdated
-5. `qualityPie()` — from quality agent's `issues[].category`, bucketed and counted
-6. `healthGauge()` — from the synthesis call's `overallHealthScore`
+Six diagrams, one function each, in `apps/synthesizer/src/diagrams/`:
+
+| # | Diagram | Built by | From |
+|---|---|---|---|
+| 1 | `moduleGraph()` | `d2-source.builder.ts` | architecture agent's `module_dependencies[]` |
+| 2 | `sequenceDiagram()` | `d2-source.builder.ts` | architecture agent's `request_flows[].steps[]` |
+| 3 | `securityFlow()` | `d2-source.builder.ts` | security agent's `auth_flow_steps[]` + `vulnerabilities[]` |
+| 4 | `dependencyGraph()` | `d2-source.builder.ts` | dependency agent's runtime deps, flagged critical/outdated |
+| 5 | `qualityDonut()` | `chart-svg.builder.ts` | quality agent's `issues[].category`, bucketed and counted |
+| 6 | `healthGauge()` | `chart-svg.builder.ts` | the synthesis call's `overallHealthScore` |
+
+**Why the last two aren't D2.** D2 is a diagram language, not a charting library
+— it has no pie, donut, or gauge primitive. Rather than abuse box shapes to fake
+one, the two purely quantitative visuals are emitted as hand-built SVG. Same
+guarantees as the D2 path: rendered once, server-side, inert markup.
+
+**Rendering rules (`d2-renderer.service.ts`):**
+- One `D2` WASM instance, lazily booted, reused for the process lifetime.
+- **Every call goes through a mutex.** `@terrastruct/d2` tracks exactly one
+  in-flight request per instance (a single `currentResolve` field), so two
+  concurrent `compile()` calls make the first hang forever and the second
+  resolve with the first's result. The library has no queue of its own.
+- On timeout the instance is **destroyed, not reused** — a late worker reply
+  would otherwise resolve the *next* diagram's promise with this one's SVG.
+- A diagram that fails to render degrades to a visible placeholder. It never
+  fails the job: the agent tokens are already spent.
+- Labels come from LLM output, so they are sanitized (quotes/backslashes
+  stripped, length-capped) and node ids are prefixed + collision-counted so
+  `src/auth` and `src.auth` can't silently merge into one node.
+
+**Accessibility rules, applied to all six:** risk is encoded as a text prefix
+(`[CRITICAL]`, `HEALTHY`) *in addition to* colour, never colour alone; the
+palette is Okabe-Ito derived (colourblind-safe); charts carry `role="img"` +
+`<title>`/`<desc>`; every chart value is directly labelled. All of this also
+means the diagrams survive greyscale printing.
+
+`@terrastruct/d2` is **ESM-only** — its advertised CommonJS build sets
+`module.exports` inside a `"type": "module"` package and throws on `require()`.
+Load it with a dynamic `import()`. Our `tsconfig` uses `module: nodenext`, which
+preserves that as a real `import()` in the CJS output instead of downlevelling
+it to `require()`. Do not change `module` to `commonjs`.
+
+Its `.d.ts` also lies about `compile()`'s second argument: the types say
+`{ options: CompileOptions }`, the runtime reads the options off the top level.
+Pass them flat — the nested form compiles clean and then silently ignores
+`layout`, so everything lays out with `dagre`.
 
 ## 10. Export pipeline detail
 
-In the PDF export controller: replace ` ```mermaid ... ``` ` fences with
-`<div class="mermaid">...</div>`, wrap the whole markdown-to-HTML output in a page
-that includes the Mermaid ESM script tag from a CDN, then pass to `md-to-pdf`.
-Puppeteer must have Chromium available — in Docker:
+Diagrams arrive at the exporter **already rendered to SVG**. The stored Markdown
+carries only each diagram's *source*, tagged with its slug:
+
+````
+```d2 architecture-modules
+direction: right
+m_api -> m_db
+```
+````
+
+The SVGs live beside it in `reports.diagrams` (jsonb). `inlineDiagrams()` in
+`@app/common` swaps each fence for its `<figure><svg>…</figcaption></figure>`.
+
+- `.md` — serve the stored Markdown directly. It keeps the D2/chart source, so
+  it stays a readable, diffable text document (a 20KB base64 SVG blob is not),
+  and the report remains re-renderable if the diagram style ever changes.
+- `.pdf` — `inlineDiagrams()` → `md-to-pdf`. **No CDN script, no client-side JS,
+  no network access.** The old Mermaid path injected `mermaid.esm.min.mjs` from
+  a CDN and relied on Puppeteer executing it before capture, which meant an
+  export silently emitted raw code blocks whenever the CDN was slow, blocked, or
+  the capture won the race. That entire class of failure is gone.
+
+Puppeteer still needs Chromium for the Markdown→PDF step — in Docker:
 
 ```dockerfile
 RUN apt-get install -y chromium
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ```
+
+Only `synthesizer` needs `@terrastruct/d2` at runtime (~58MB of WASM); the
+Dockerfile prunes it from the other three images. `api-gateway` embeds SVG the
+synthesizer already produced — it needs the strings, not the renderer.
 
 ## 11. RabbitMQ config
 
@@ -235,9 +299,17 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
   deployment/scaling at this project's scale."
 - "Token usage is tracked per agent run in Postgres specifically so cost is
   measurable and cappable, not just 'trust me it's cheap.'"
-- "Mermaid diagrams are generated from structured agent JSON in plain TypeScript,
-  not written by the LLM, so they can't hallucinate relationships that don't exist
+- "Diagrams are generated from structured agent JSON in plain TypeScript, not
+  written by the LLM, so they can't hallucinate relationships that don't exist
   in the code."
+- "I render D2 to SVG server-side, at report-build time. Mermaid only renders in
+  a browser, so the PDF exporter had to inject a CDN script and hope Puppeteer
+  executed it before capture — a race that fails silently into raw code blocks.
+  Now the SVG is inert: the PDF path and the frontend both just embed a string,
+  and neither needs a diagram library or network access."
+- "The stored Markdown keeps the diagram *source*, not the SVG, so a `.md` export
+  is still a readable text document and restyling every diagram never means
+  re-running the agents."
 
 ---
 

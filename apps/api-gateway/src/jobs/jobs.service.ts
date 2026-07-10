@@ -12,6 +12,8 @@ import {
   PrismaService,
   Job,
   Report,
+  RenderedDiagram,
+  SonnetSynthesisOutput,
   AgentType,
   ANALYSIS_REQUESTED_QUEUE,
   jobStatusKey,
@@ -29,10 +31,32 @@ export interface AgentResultSummary {
   agentType: AgentType;
   status: 'success' | 'failed';
   error: string | null;
+  /**
+   * The agent's validated JSON output. Shipped so the frontend can render the
+   * report as data — severity-ranked vulnerabilities, issue categories, dep
+   * risks — rather than scraping the Markdown the same JSON was rendered into.
+   * Null on a failed agent run.
+   */
+  rawOutput: unknown;
+  tokensUsed: { input: number; output: number };
+  durationMs: number | null;
+}
+
+export interface ReportPayload {
+  markdownContent: string;
+  /**
+   * Pre-rendered SVG per diagram, spliced into the Markdown client-side (see
+   * `inlineDiagrams`). No diagram library runs in the browser — it only ever
+   * embeds strings.
+   */
+  diagrams: RenderedDiagram[];
+  /** Null for reports written before synthesis was persisted structurally. */
+  synthesis: SonnetSynthesisOutput | null;
+  totalTokens: number;
 }
 
 export interface JobWithReport extends Job {
-  report: { markdownContent: string } | null;
+  report: ReportPayload | null;
   agentResults: AgentResultSummary[];
 }
 
@@ -76,9 +100,7 @@ export class JobsService {
 
     return {
       ...job,
-      report: job.report
-        ? { markdownContent: job.report.markdownContent }
-        : null,
+      report: job.report ? toReportPayload(job.report) : null,
       agentResults: await this.getLatestAgentResults(jobId),
     };
   }
@@ -208,21 +230,47 @@ export class JobsService {
     return { ...job, status: 'pending', completedAt: null };
   }
 
-  private async getLatestAgentResults(
-    jobId: string,
-  ): Promise<AgentResultSummary[]> {
+  async getLatestAgentResults(jobId: string): Promise<AgentResultSummary[]> {
     const rows = await this.prisma.agentResult.findMany({
       where: { jobId },
       orderBy: { createdAt: 'desc' },
-      select: { agentType: true, status: true, error: true },
+      select: {
+        agentType: true,
+        status: true,
+        error: true,
+        rawOutput: true,
+        tokensUsed: true,
+        durationMs: true,
+      },
     });
 
     const latestByType = new Map<AgentType, AgentResultSummary>();
     for (const row of rows) {
-      if (!latestByType.has(row.agentType)) {
-        latestByType.set(row.agentType, row);
-      }
+      if (latestByType.has(row.agentType)) continue;
+      latestByType.set(row.agentType, {
+        agentType: row.agentType,
+        status: row.status,
+        error: row.error,
+        // A failed agent's rawOutput is `{}` — surface it as absent, not as an
+        // empty object the frontend would render as a section with no findings.
+        rawOutput: row.status === 'success' ? row.rawOutput : null,
+        tokensUsed: (row.tokensUsed ?? { input: 0, output: 0 }) as {
+          input: number;
+          output: number;
+        },
+        durationMs: row.durationMs,
+      });
     }
     return [...latestByType.values()];
   }
+}
+
+/** Report row -> API payload. Shared by the owner and share-link read paths. */
+export function toReportPayload(report: Report): ReportPayload {
+  return {
+    markdownContent: report.markdownContent,
+    diagrams: (report.diagrams ?? []) as unknown as RenderedDiagram[],
+    synthesis: (report.synthesis ?? null) as SonnetSynthesisOutput | null,
+    totalTokens: report.totalTokens,
+  };
 }

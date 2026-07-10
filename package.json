@@ -54,6 +54,7 @@
     "@nestjs/platform-socket.io": "^11.0.1",
     "@nestjs/websockets": "^11.0.1",
     "@prisma/client": "^6.2.1",
+    "@terrastruct/d2": "^0.1.33",
     "amqp-connection-manager": "^4.1.14",
     "amqplib": "^0.10.4",
     "class-transformer": "^0.5.1",

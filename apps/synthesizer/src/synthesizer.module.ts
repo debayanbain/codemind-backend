@@ -3,7 +3,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { RedisModule } from '@nestjs-modules/ioredis';
 import { PrismaModule, buildRedisOptions } from '@app/common';
 
-import { MermaidBuilder } from './mermaid/mermaid.builder';
+import { ChartSvgBuilder } from './diagrams/chart-svg.builder';
+import { D2Renderer } from './diagrams/d2-renderer.service';
+import { D2SourceBuilder } from './diagrams/d2-source.builder';
+import { DiagramsService } from './diagrams/diagrams.service';
 import { ReportRenderer } from './report/report-renderer.service';
 import { SynthesizerService } from './synthesis/synthesizer.service';
 
@@ -16,6 +19,13 @@ import { SynthesizerService } from './synthesis/synthesizer.service';
       useFactory: buildRedisOptions,
     }),
   ],
-  providers: [MermaidBuilder, ReportRenderer, SynthesizerService],
+  providers: [
+    D2SourceBuilder,
+    ChartSvgBuilder,
+    D2Renderer,
+    DiagramsService,
+    ReportRenderer,
+    SynthesizerService,
+  ],
 })
 export class SynthesizerModule {}
