@@ -55,13 +55,29 @@ describe('D2SourceBuilder', () => {
       expect(builder.moduleGraph({})).toContain('Module graph not available');
     });
 
-    it('does not emit an entry point twice', () => {
+    it('does not inject entry-point files as graph nodes', () => {
+      // Entry points are file-level now; the module graph is dir/layer-level,
+      // so an entry file that is not itself a module must not appear as a node.
       const src = builder.moduleGraph({
-        entry_points: ['main.ts'],
-        modules: ['main.ts', 'other.ts'],
+        entry_points: ['src/main.ts'],
+        modules: ['api', 'common'],
+        module_dependencies: [{ from: 'api', to: 'common' }],
       });
 
-      expect(src.match(/m_main_ts:/g)).toHaveLength(1);
+      expect(src).not.toContain('m_src_main_ts');
+      expect(src).toContain('m_api -> m_common');
+    });
+
+    it('styles a root module (no incoming edge) as an entry layer', () => {
+      const src = builder.moduleGraph({
+        modules: ['api', 'common'],
+        module_dependencies: [{ from: 'api', to: 'common' }],
+      });
+
+      // `api` is a root → gets an entry-styled block with fill; `common` is a
+      // plain node. The entry palette fill only attaches to the root's block.
+      const apiBlock = /m_api: "api" \{[^}]*\}/.exec(src)?.[0] ?? '';
+      expect(apiBlock).toContain('style.fill');
     });
 
     it('skips edges with a missing endpoint', () => {

@@ -24,6 +24,8 @@ export class ReportRenderer {
     const qual = o.quality ?? {};
     const docs = o.docs ?? {};
 
+    const moduleResponsibilities = arch.module_responsibilities ?? [];
+    const requestFlowMeta = arch.request_flows ?? [];
     const designPatterns = arch.design_patterns ?? [];
     const sensitiveEndpoints = sec.sensitive_endpoints ?? [];
     const vulnerabilities = sec.vulnerabilities ?? [];
@@ -74,13 +76,27 @@ ${arch.summary ?? ''}
 ${d.fence('architecture-modules')}
 `);
 
+    if (moduleResponsibilities.length > 0) {
+      sections.push(`### Modules
+
+| Module | Responsibility |
+|--------|----------------|
+${moduleResponsibilities
+  .map((m) => `| \`${m.module}\` | ${m.responsibility} |`)
+  .join('\n')}
+`);
+    }
+
     const requestFlows = d.matching(/^request-flow-\d+$/);
     if (requestFlows.length > 0) {
       sections.push(`### Request Flows
 `);
-      requestFlows.forEach((flow) => {
+      requestFlows.forEach((flow, i) => {
+        // request-flow-1 correlates to request_flows[0]; surface its
+        // description under the heading when the agent provided one.
+        const description = requestFlowMeta[i]?.description;
         sections.push(`#### ${flow.title}
-
+${description ? `\n${description}\n` : ''}
 ${d.fence(flow.slug)}
 `);
       });

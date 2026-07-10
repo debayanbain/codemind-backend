@@ -23,7 +23,8 @@ Required output schema:
 
 doc_score: 0-100 overall documentation health score.
 public_exports: names of exported functions/classes/modules.
-undocumented_public_apis: public exports with no JSDoc/docstring.`;
+undocumented_public_apis: public exports with no JSDoc/docstring.
+summary: 3-4 sentences on documentation quality — what the README covers well, the biggest gaps (contribution guide, changelog, API docs), and how approachable the project is for a newcomer.`;
 
   buildUserMessage(ctx: AgentContext): string {
     return `Evaluate the documentation coverage of this codebase.

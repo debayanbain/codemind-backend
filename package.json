@@ -21,6 +21,7 @@
     "start:synthesizer": "nest start synthesizer",
     "start:synthesizer:dev": "nest start synthesizer --watch",
     "lint": "eslint \"{apps,libs,test}/**/*.ts\" --fix",
+    "docker:start:dev": "docker compose -f docker-compose.dev.yml up --build -d redis rabbitmq migrate orchestrator agent-worker synthesizer",
     "docker:dev": "docker compose -f docker-compose.dev.yml up --build",
     "docker:dev:down": "docker compose -f docker-compose.dev.yml down",
     "docker:prod": "docker compose up --build -d",

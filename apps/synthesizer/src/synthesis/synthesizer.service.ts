@@ -73,11 +73,41 @@ export class SynthesizerService implements OnModuleInit {
     const t = Date.now();
 
     try {
-      // 1. Load all agent results from Postgres. rawOutput is untyped LLM JSON
-      //    at the DB boundary — one explicit cast here, typed everywhere after.
-      const results = await this.prisma.agentResult.findMany({
+      // 1. Load agent results from Postgres. rawOutput is untyped LLM JSON at
+      //    the DB boundary — one explicit cast here, typed everywhere after.
+      //    Retries append new rows rather than replacing, so a job can carry
+      //    several rows per agent type; collapse to the most recent attempt per
+      //    type (same rule the API's getLatestAgentResults uses) so superseded
+      //    rows never poison the Sonnet input or double-count tokens.
+      const allRows = await this.prisma.agentResult.findMany({
         where: { jobId },
+        orderBy: { createdAt: 'desc' },
       });
+      const latestByType = new Map<string, (typeof allRows)[number]>();
+      for (const row of allRows) {
+        if (!latestByType.has(row.agentType)) latestByType.set(row.agentType, row);
+      }
+      const results = [...latestByType.values()];
+
+      // If not one agent produced usable output there is nothing to synthesize
+      // — a Sonnet call over five empty objects yields a hallucinated report.
+      // This is the signature of a broken run (e.g. the code graph failed to
+      // build, so every agent errored with "CodeGraph not initialized"). Fail
+      // the job with a clear, user-actionable reason instead of emitting junk
+      // or hanging forever; the frontend turns job:failed into a retry action.
+      const succeeded = results.filter((r) => r.status === 'success');
+      if (succeeded.length === 0) {
+        this.logger.warn(
+          `All ${results.length} agent(s) failed — marking job failed instead of synthesizing [job=${jobId}]`,
+        );
+        await this.failJob(
+          jobId,
+          'Analysis could not be completed — none of the agents produced a result. ' +
+            'This usually means the code graph failed to build for this repository. Please retry.',
+        );
+        return;
+      }
+
       const byType = Object.fromEntries(
         results.map((r) => [r.agentType, r.rawOutput]),
       ) as AgentOutputsByType;
@@ -143,20 +173,26 @@ export class SynthesizerService implements OnModuleInit {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`Synthesis failed [job=${jobId}]: ${message}`);
-
-      await this.prisma.job.update({
-        where: { id: jobId },
-        data: { status: 'failed', completedAt: new Date() },
-      });
-      await this.redis.set(jobStatusKey(jobId), 'failed');
-
-      const event: JobEventPayload = {
-        type: 'job:failed',
-        jobId,
-        reason: message,
-      };
-      await this.redis.publish(jobEventsChannel(jobId), JSON.stringify(event));
+      await this.failJob(jobId, message);
     }
+  }
+
+  /**
+   * Move a job to a terminal `failed` state and tell the frontend why. Clears
+   * the completion-tracking sets too, so a subsequent retry starts from a clean
+   * slate rather than inheriting a half-full agents_done. Shared by the
+   * all-agents-failed guard and the catch-all synthesis error path.
+   */
+  private async failJob(jobId: string, reason: string): Promise<void> {
+    await this.prisma.job.update({
+      where: { id: jobId },
+      data: { status: 'failed', completedAt: new Date() },
+    });
+    await this.redis.set(jobStatusKey(jobId), 'failed');
+    await this.redis.del(jobAgentsDoneKey(jobId), jobAgentsExpectedKey(jobId));
+
+    const event: JobEventPayload = { type: 'job:failed', jobId, reason };
+    await this.redis.publish(jobEventsChannel(jobId), JSON.stringify(event));
   }
 
   private async callSonnet(
@@ -165,18 +201,17 @@ export class SynthesizerService implements OnModuleInit {
     const response = await this.client.complete({
       anthropicModel: SONNET_MODEL,
       openaiModel: OPENAI_SYNTHESIS_MODEL,
-      maxTokens: 1000,
-      system: `You are a principal engineer writing a brief technical assessment.
-        Respond ONLY with valid JSON. No preamble, no markdown fences.
+      maxTokens: 1400,
+      system: `You are a principal engineer writing the executive assessment at the top of a codebase intelligence report that a developer will actually read. Respond ONLY with valid JSON. No preamble, no markdown fences.
         Schema:
         {
-          "executiveSummary": string,    // 3-4 sentences, cross-cutting insight from all agents
-          "recommendations": string[],  // top 5 actionable recommendations, ordered by priority
-          "overallHealthScore": number  // 0-100 codebase health score
+          "executiveSummary": string,    // 5-8 sentences. Lead with what the system IS and its architecture, then weave in the cross-cutting findings — the most important security, quality, dependency, and documentation signals — and end with the overall risk posture. Reference concrete specifics from the agent outputs (frameworks, real modules, named vulnerabilities/issues). No filler, no generic praise.
+          "recommendations": string[],  // top 5 concrete, actionable recommendations ordered by priority (highest impact first). Each names the specific problem and the fix.
+          "overallHealthScore": number  // 0-100 codebase health score, justified by the findings below
         }`,
       user: `Here are structured outputs from specialized analysis agents for the same codebase.
 
-          Write an executive summary and prioritized recommendations based on cross-agent patterns.
+          Synthesize them into one coherent assessment. Do not just restate each agent — connect findings across agents (e.g. a security gap that is worse because tests are absent). Ground every claim in the data below.
 
           ## Architecture Agent Output
           ${JSON.stringify(byType.architecture ?? {}, null, 2)}

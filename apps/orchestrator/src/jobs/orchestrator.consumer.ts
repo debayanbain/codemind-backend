@@ -85,6 +85,13 @@ export class OrchestratorConsumer {
         user.githubAccessTokenEncrypted,
       );
 
+      // The run epoch (bumped by force-stop-and-retry) both fences stale
+      // in-flight agent messages AND keys this run's repo directory, so a late
+      // straggler from a superseded run can't delete the folder this run just
+      // indexed. Read it up front — it names the checkout dir. Unset == gen 0.
+      const epoch = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
+      const runKey = `${jobId}-${epoch}`;
+
       // Repo dir is always re-downloaded — the previous run's checkout +
       // CodeGraph DB were deleted by the last agent to finish (success or
       // fail), whether this is a fresh run or a retry.
@@ -92,6 +99,7 @@ export class OrchestratorConsumer {
         repoFullName,
         accessToken,
         jobId,
+        runKey,
       );
 
       // Pure AST parsing — zero LLM cost.
@@ -110,10 +118,6 @@ export class OrchestratorConsumer {
         await this.redis.sadd(jobAgentsExpectedKey(jobId), ...agentTypes);
       }
 
-      // Stamp every dispatched message with the job's current run epoch, so a
-      // force-stop (which bumps this) fences stale in-flight messages out. Unset
-      // == generation 0.
-      const epoch = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
       this.dispatchService.dispatch(jobId, repoPath, agentTypes, manifest, epoch);
 
       this.logger.log(

@@ -14,6 +14,14 @@ export interface ModuleDependency {
 export interface RequestFlow {
   name: string;
   steps: string[];
+  /** One-line plain-English description of what the flow accomplishes. */
+  description?: string;
+}
+
+/** A directory/layer-level module and what it is responsible for. */
+export interface ModuleResponsibility {
+  module: string;
+  responsibility: string;
 }
 
 export interface ArchitectureOutput {
@@ -21,11 +29,20 @@ export interface ArchitectureOutput {
   language?: string;
   architecture_pattern?: string;
   entry_points?: string[];
+  /**
+   * Directory/layer-level module names (e.g. `api-gateway`, `components`,
+   * `lib`), NOT individual files/components/functions. These are the nodes of
+   * the wiring graph.
+   */
   modules?: string[];
+  /** Import-direction edges BETWEEN the modules above, aggregated to the module level. */
   module_dependencies?: ModuleDependency[];
+  /** Per-module one-liner: what each module is responsible for. Drives the module table. */
+  module_responsibilities?: ModuleResponsibility[];
   services?: string[];
   request_flows?: RequestFlow[];
   design_patterns?: string[];
+  /** Fuller architectural narrative (3-6 sentences). */
   summary?: string;
 }
 

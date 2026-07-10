@@ -29,29 +29,41 @@ export class D2SourceBuilder {
   // ─── 1. Module dependency graph (architecture agent) ───────────────────────
 
   moduleGraph(arch: ArchitectureOutput): string {
-    const deps = arch.module_dependencies ?? [];
-    const modules = arch.modules ?? [];
-    const entries = arch.entry_points ?? [];
+    const deps = (arch.module_dependencies ?? []).filter((d) => d.from && d.to);
+    const declared = arch.modules ?? [];
 
-    if (modules.length === 0 && deps.length === 0) {
+    // Nodes are directory/layer modules — NOT entry-point files (those are
+    // file-level now and would dangle disconnected in a module graph; they're
+    // listed separately in the report). The node set is the declared modules
+    // plus anything an edge references, so no edge ever points at an
+    // undeclared, unstyled auto-created node.
+    const nodeSet = new Set<string>(declared);
+    for (const { from, to } of deps) {
+      nodeSet.add(from);
+      nodeSet.add(to);
+    }
+
+    if (nodeSet.size === 0) {
       return this.placeholder('Module graph not available');
     }
+
+    // A module with no incoming edge is a root of the wiring (an entry layer) —
+    // style it like an entry point so the graph reads top-down at a glance.
+    const hasIncoming = new Set(deps.map((d) => d.to));
 
     const ids = new IdAllocator('m');
     const lines = ['direction: right'];
 
-    for (const ep of entries.slice(0, 3)) {
-      lines.push(this.node(ids.get(ep), ep, PALETTE.entry));
-    }
-    for (const m of modules.slice(0, D2SourceBuilder.MAX_MODULES)) {
-      if (entries.includes(m)) continue;
-      lines.push(this.node(ids.get(m), m));
+    for (const m of [...nodeSet].slice(0, D2SourceBuilder.MAX_MODULES)) {
+      lines.push(this.node(ids.get(m), m, hasIncoming.has(m) ? undefined : PALETTE.entry));
     }
     for (const { from, to, label } of deps.slice(
       0,
       D2SourceBuilder.MAX_EDGES,
     )) {
-      if (!from || !to) continue;
+      // Skip edges whose endpoints were dropped by the node cap — resolving
+      // them through the allocator would silently resurrect a dangling node.
+      if (!ids.has(from) || !ids.has(to)) continue;
       lines.push(this.edge(ids.get(from), ids.get(to), label));
     }
 
@@ -256,6 +268,11 @@ class IdAllocator {
   private readonly taken = new Set<string>();
 
   constructor(private readonly prefix: string) {}
+
+  /** True if this label already has an allocated id (without allocating one). */
+  has(label: string): boolean {
+    return this.byLabel.has(label);
+  }
 
   get(label: string): string {
     const existing = this.byLabel.get(label);

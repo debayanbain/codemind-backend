@@ -14,8 +14,15 @@ export class TarballDownloadError extends Error {}
 
 /**
  * Downloads a repo via GitHub's tarball API and extracts it to
- * /tmp/repos/{jobId}/ — explicitly NOT `git clone` (Section 3: no git binary
+ * /tmp/repos/{runKey}/ — explicitly NOT `git clone` (Section 3: no git binary
  * dependency).
+ *
+ * `runKey` is the per-run directory name (`{jobId}-{epoch}`), NOT the bare
+ * jobId: a force-stop-and-retry bumps the epoch, and an in-flight agent from
+ * the superseded run can finish late and delete its own run's repo dir on
+ * cleanup. Keying the directory by epoch means each run owns a distinct
+ * folder, so that late cleanup can't wipe the freshly-indexed graph the new
+ * run's agents depend on ("CodeGraph not initialized").
  */
 @Injectable()
 export class GithubTarballService {
@@ -27,9 +34,10 @@ export class GithubTarballService {
     repoFullName: string,
     accessToken: string,
     jobId: string,
+    runKey: string = jobId,
   ): Promise<{ repoPath: string }> {
-    const repoPath = path.join(REPOS_TMP_DIR, jobId);
-    const archivePath = path.join(REPOS_TMP_DIR, `${jobId}.tar.gz`);
+    const repoPath = path.join(REPOS_TMP_DIR, runKey);
+    const archivePath = path.join(REPOS_TMP_DIR, `${runKey}.tar.gz`);
     const maxBytes =
       this.config.get<number>('MAX_REPO_SIZE_MB', 200) * 1024 * 1024;
     const maxFiles = this.config.get<number>('MAX_REPO_FILE_COUNT', 5000);

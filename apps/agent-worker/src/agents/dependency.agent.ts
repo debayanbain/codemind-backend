@@ -20,7 +20,8 @@ Required output schema:
 }
 
 critical_deps = dependencies that if removed would break core functionality.
-outdated_risks = packages known to have security issues or that are deprecated.`;
+outdated_risks = packages known to have security issues or that are deprecated.
+summary: 2-4 sentences on the dependency footprint — the core stack, how many runtime deps, and the notable risks (outdated/at-risk/license). Specific, not generic.`;
 
   buildUserMessage(ctx: AgentContext): string {
     return `Analyze this project's dependencies.

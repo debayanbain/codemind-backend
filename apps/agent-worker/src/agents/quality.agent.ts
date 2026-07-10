@@ -19,8 +19,9 @@ Required output schema:
   "summary": string
 }
 
-issues: max 10 most important. Focus on patterns, not nitpicks.
-complexity_hotspots: file or function names that appear deeply nested or overly complex.`;
+issues: max 10 most important. Focus on patterns, not nitpicks. location = real file:line or file when known.
+complexity_hotspots: file or function names that appear deeply nested or overly complex.
+summary: 3-5 sentences on overall code quality — error handling, type safety, test presence, and the main maintainability risks. Concrete, referencing real files where possible.`;
 
   buildUserMessage(ctx: AgentContext): string {
     return `Review the code quality of this codebase.

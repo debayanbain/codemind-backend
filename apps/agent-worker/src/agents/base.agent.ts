@@ -33,6 +33,13 @@ export abstract class BaseAgent {
   abstract readonly systemPrompt: string;
   abstract buildUserMessage(ctx: AgentContext): string;
 
+  /**
+   * Max output tokens for this agent's LLM call. Extraction agents are fine on
+   * the default; architecture asks for a fuller structural map and overrides
+   * this upward. Kept modest — output tokens count against the job budget.
+   */
+  protected readonly maxOutputTokens: number = 1500;
+
   async run(ctx: AgentContext): Promise<AgentResult> {
     const t = Date.now();
 
@@ -44,7 +51,7 @@ export abstract class BaseAgent {
       const response = await this.client.complete({
         anthropicModel: HAIKU_MODEL,
         openaiModel: OPENAI_AGENT_MODEL,
-        maxTokens: 1500,
+        maxTokens: this.maxOutputTokens,
         system: this.systemPrompt,
         user: userMsg,
       });

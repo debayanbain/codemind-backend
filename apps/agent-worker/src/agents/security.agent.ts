@@ -19,9 +19,10 @@ Required output schema:
   "summary": string
 }
 
-auth_flow_steps: ordered list of components in the auth chain (e.g. ["Client", "AuthGuard", "JwtStrategy", "UsersService", "Handler"]).
+auth_flow_steps: ordered list of components in the auth chain (e.g. ["Client", "AuthGuard", "JwtStrategy", "UsersService", "Handler"]). Use real names from the code; return [] if there is no authentication.
 Keep vulnerabilities to real findings only. Do not hallucinate vulnerabilities.
-If additionalContext says no Dockerfile was found, do not report container-security findings.`;
+If additionalContext says no Dockerfile was found, do not report container-security findings.
+summary: 3-5 sentences describing the overall security posture — what protections exist, the most important gaps, and the resulting risk level. Reference real components; be specific, not generic.`;
 
   buildUserMessage(ctx: AgentContext): string {
     return `Audit this codebase for security issues.
