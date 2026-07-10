@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../dist/apps/orchestrator",
+    "tsBuildInfoFile": "../../dist/apps/orchestrator/tsconfig.app.tsbuildinfo"
+  },
+  "include": [
+    "src/**/*",
+    "../../libs/common/src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "test",
+    "dist",
+    "**/*spec.ts"
+  ]
+}

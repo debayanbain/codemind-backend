@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../dist/apps/api-gateway",
+    "tsBuildInfoFile": "../../dist/apps/api-gateway/tsconfig.app.tsbuildinfo"
+  },
+  "include": [
+    "src/**/*",
+    "../../libs/common/src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "test",
+    "dist",
+    "**/*spec.ts"
+  ]
+}

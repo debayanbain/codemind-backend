@@ -1,0 +1,139 @@
+x-app-env: &app-env
+  env_file:
+    - .env
+  environment:
+    # Inside the compose network, apps reach RabbitMQ/Redis by service name,
+    # not localhost. Postgres isn't here — DATABASE_URL/DIRECT_URL (Supabase)
+    # are already fully-qualified and come straight from .env via env_file.
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    RABBITMQ_URL: amqp://${RABBITMQ_USER:-codemind}:${RABBITMQ_PASSWORD:-codemind}@rabbitmq:5672
+    LOG_DIR: /app/logs
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-infra-healthy: &infra-healthy
+  migrate:
+    condition: service_completed_successfully
+  redis:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
+x-network: &network
+  networks:
+    - codemind_network
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: codemind-redis
+    restart: unless-stopped
+    <<: *network
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - codemind_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: codemind-rabbitmq
+    restart: unless-stopped
+    <<: *network
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-codemind}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-codemind}
+    ports:
+      - '${RABBITMQ_PORT:-5672}:5672' # AMQP
+      - '${RABBITMQ_MGMT_PORT:-15672}:15672' # Management UI
+    volumes:
+      - codemind_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', 'check_port_connectivity']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── one-shot: runs `prisma migrate deploy` against Supabase, then exits.
+  #    Apps wait on it via `service_completed_successfully` so nothing starts
+  #    against an un-migrated schema.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrator
+    <<: *network
+    env_file:
+      - .env
+    restart: 'no'
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: api-gateway
+        INSTALL_CHROMIUM: 'true' # needed for PDF export (md-to-pdf/Puppeteer)
+    <<: [*app-env, *network]
+    restart: unless-stopped
+    ports:
+      - '${API_GATEWAY_PORT:-3000}:3000'
+    volumes:
+      - ./logs:/app/logs
+    depends_on: *infra-healthy
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: orchestrator
+    <<: [*app-env, *network]
+    restart: unless-stopped
+    volumes:
+      # Shared with agent-worker: orchestrator writes the extracted repo +
+      # CodeGraph DB, agent-worker re-opens it read-only in a *different*
+      # container, so both need the same underlying filesystem, not just the
+      # same path name.
+      - codemind_repo_tmp:/tmp/repos
+      - ./logs:/app/logs
+    depends_on: *infra-healthy
+
+  agent-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: agent-worker
+    <<: [*app-env, *network]
+    restart: unless-stopped
+    volumes:
+      - codemind_repo_tmp:/tmp/repos
+      - ./logs:/app/logs
+    depends_on: *infra-healthy
+
+  synthesizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: synthesizer
+    <<: [*app-env, *network]
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    depends_on: *infra-healthy
+
+networks:
+  codemind_network:
+    driver: bridge
+    name: codemind_network
+
+volumes:
+  codemind_redis_data:
+  codemind_rabbitmq_data:
+  codemind_repo_tmp:

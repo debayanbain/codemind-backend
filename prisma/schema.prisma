@@ -1,0 +1,94 @@
+// Matches CLAUDE.md Section 7's table/column names via @map/@@map — model
+// and field names stay idiomatic camelCase in TypeScript, the underlying
+// Postgres schema stays snake_case.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Pooled connection (Supabase Supavisor / pgbouncer, port 6543) — what the
+  // 4 long-running app processes use for normal queries.
+  url       = env("DATABASE_URL")
+  // Direct connection (port 5432) — required by `prisma migrate`, which
+  // can't run through a transaction pooler.
+  directUrl = env("DIRECT_URL")
+}
+
+enum JobStatus {
+  pending
+  running
+  done
+  failed
+}
+
+enum AgentType {
+  architecture
+  security
+  dependency
+  quality
+  docs
+}
+
+enum AgentRunStatus {
+  success
+  failed
+}
+
+model User {
+  id                         String   @id @default(uuid())
+  githubId                   String   @unique @map("github_id")
+  githubAccessTokenEncrypted String   @map("github_access_token_encrypted")
+  githubUsername             String?  @map("github_username")
+  avatarUrl                  String?  @map("avatar_url")
+  createdAt                  DateTime @default(now()) @map("created_at")
+
+  jobs Job[]
+
+  @@map("users")
+}
+
+model Job {
+  id           String    @id @default(uuid())
+  userId       String    @map("user_id")
+  repoFullName String    @map("repo_full_name")
+  status       JobStatus @default(pending)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  completedAt  DateTime? @map("completed_at")
+
+  user         User          @relation(fields: [userId], references: [id])
+  agentResults AgentResult[]
+  report       Report?
+
+  @@index([userId])
+  @@map("jobs")
+}
+
+model AgentResult {
+  id         String         @id @default(uuid())
+  jobId      String         @map("job_id")
+  agentType  AgentType      @map("agent_type")
+  rawOutput  Json           @default("{}") @map("raw_output")
+  tokensUsed Json           @default("{\"input\":0,\"output\":0}") @map("tokens_used")
+  status     AgentRunStatus
+  durationMs Int?           @map("duration_ms")
+  error      String?
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  job Job @relation(fields: [jobId], references: [id])
+
+  @@index([jobId])
+  @@map("agent_results")
+}
+
+model Report {
+  id              String   @id @default(uuid())
+  jobId           String   @unique @map("job_id")
+  markdownContent String   @map("markdown_content")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  job Job @relation(fields: [jobId], references: [id])
+
+  @@map("reports")
+}

@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+
+# Development-only image — never used in production (see Dockerfile /
+# docker-compose.yml for that). One shared image for all 4 apps: full deps
+# (incl. devDependencies), no compiled build step. `nest start --watch`
+# recompiles on save. docker-compose.dev.yml bind-mounts the real source over
+# the COPY below, so host edits hot-reload without an image rebuild; the COPY
+# only makes the image runnable standalone.
+
+ARG NODE_VERSION=22-slim
+FROM node:${NODE_VERSION}
+WORKDIR /app
+
+ENV NODE_ENV=development
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+# Installed unconditionally — only api-gateway needs it (PDF export), but
+# this one image is shared by all 4 dev services and dev image size doesn't
+# matter the way prod image size does.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends chromium && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+COPY prisma ./prisma
+RUN npm ci
+
+COPY . .
+
+# APP_NAME is set at container runtime (docker-compose.dev.yml), not build
+# time — one image, started 4 different ways.
+CMD ["sh", "-c", "npx nest start ${APP_NAME} --watch"]

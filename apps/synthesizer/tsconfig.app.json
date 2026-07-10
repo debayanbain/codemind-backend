@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../dist/apps/synthesizer",
+    "tsBuildInfoFile": "../../dist/apps/synthesizer/tsconfig.app.tsbuildinfo"
+  },
+  "include": [
+    "src/**/*",
+    "../../libs/common/src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "test",
+    "dist",
+    "**/*spec.ts"
+  ]
+}

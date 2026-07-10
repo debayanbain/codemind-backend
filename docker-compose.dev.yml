@@ -1,0 +1,147 @@
+x-env-file: &env-file
+  env_file:
+    - .env
+
+x-common-env: &common-env
+  NODE_ENV: development
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-codemind}:${RABBITMQ_PASSWORD:-codemind}@rabbitmq:5672
+  LOG_DIR: /app/logs
+  LOG_LEVEL: ${LOG_LEVEL:-debug}
+
+x-infra-healthy: &infra-healthy
+  migrate:
+    condition: service_completed_successfully
+  redis:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
+x-network: &network
+  networks:
+    - codemind_dev_network
+
+# Source bind-mounted read/write for hot reload; node_modules and dist stay
+# as anonymous volumes so the host's (possibly missing, possibly wrong-arch)
+# copies never shadow what was `npm ci`'d inside the image.
+x-source-mount: &source-mount
+  volumes:
+    - .:/app
+    - /app/node_modules
+    - /app/dist
+    - codemind_dev_repo_tmp:/tmp/repos
+    - ./logs:/app/logs
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: codemind-dev-redis
+    restart: unless-stopped
+    <<: *network
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - codemind_dev_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: codemind-dev-rabbitmq
+    restart: unless-stopped
+    <<: *network
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-codemind}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-codemind}
+    ports:
+      - '${RABBITMQ_PORT:-5672}:5672'
+      - '${RABBITMQ_MGMT_PORT:-15672}:15672'
+    volumes:
+      - codemind_dev_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # check_running + check_local_alarms reports healthy only once the broker
+      # actually accepts AMQP connections — check_port_connectivity flips healthy
+      # while the port is open but the broker is still starting, letting apps
+      # race in and crash on connect.
+      test:
+        ['CMD-SHELL', 'rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_local_alarms']
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: codemind-dev-migrate
+    <<: [*env-file, *network]
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    restart: 'no'
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: codemind-dev-api-gateway
+    <<: [*env-file, *network, *source-mount]
+    environment:
+      <<: *common-env
+      APP_NAME: api-gateway
+    restart: unless-stopped
+    ports:
+      - '${API_GATEWAY_PORT:-3000}:3000'
+    depends_on: *infra-healthy
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: codemind-dev-orchestrator
+    <<: [*env-file, *network, *source-mount]
+    environment:
+      <<: *common-env
+      APP_NAME: orchestrator
+    restart: unless-stopped
+    depends_on: *infra-healthy
+
+  agent-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: codemind-dev-agent-worker
+    <<: [*env-file, *network, *source-mount]
+    environment:
+      <<: *common-env
+      APP_NAME: agent-worker
+    restart: unless-stopped
+    depends_on: *infra-healthy
+
+  synthesizer:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: codemind-dev-synthesizer
+    <<: [*env-file, *network, *source-mount]
+    environment:
+      <<: *common-env
+      APP_NAME: synthesizer
+    restart: unless-stopped
+    depends_on: *infra-healthy
+
+networks:
+  codemind_dev_network:
+    driver: bridge
+    name: codemind_dev_network
+
+volumes:
+  codemind_dev_redis_data:
+  codemind_dev_rabbitmq_data:
+  codemind_dev_repo_tmp:
