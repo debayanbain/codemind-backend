@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import {
   AgentOutputsByType,
   RenderedDiagram,
+  RepoFacts,
   normalizeSvgForHtml,
 } from '@app/common';
 import { D2SourceBuilder } from './d2-source.builder';
@@ -33,6 +34,7 @@ export class DiagramsService {
   async buildAll(
     byType: AgentOutputsByType,
     overallHealthScore: number,
+    facts?: RepoFacts,
   ): Promise<RenderedDiagram[]> {
     const arch = byType.architecture ?? {};
     const sec = byType.security ?? {};
@@ -42,11 +44,38 @@ export class DiagramsService {
     const started = Date.now();
     const diagrams: RenderedDiagram[] = [];
 
+    // The module graph is drawn from the AST's real import edges when we have
+    // them, and only falls back to the architecture agent's account when we
+    // don't.
+    //
+    // This is what makes "the diagrams can't hallucinate relationships" true
+    // rather than aspirational. The claim was always made about the *builder*
+    // being plain TypeScript — but a deterministic builder fed invented input
+    // draws an invented graph, and `module_dependencies[]` was invented. Now the
+    // edges are `getFileDependencies` aggregated to module level: an edge on
+    // this diagram is an import that exists.
+    const moduleSource = facts?.moduleDependencies.length
+      ? this.d2.moduleGraph({
+          modules: facts.modules.map((m) => m.name),
+          module_dependencies: facts.moduleDependencies.map((e) => ({
+            from: e.from,
+            to: e.to,
+            label: `${e.weight}`,
+          })),
+        })
+      : this.d2.moduleGraph(arch);
+
+    if (!facts?.moduleDependencies.length) {
+      this.logger.warn(
+        'No measured module edges — falling back to the architecture agent’s account for the module graph',
+      );
+    }
+
     diagrams.push(
       await this.d2Diagram(
         'architecture-modules',
         'Module dependency graph',
-        this.d2.moduleGraph(arch),
+        moduleSource,
         'elk',
       ),
     );

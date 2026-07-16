@@ -5,8 +5,16 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectRedis } from '@nestjs-modules/ioredis';
+import Redis from 'ioredis';
 import * as amqplib from 'amqplib';
-import { AGENT_DLQS, AgentType, DELIVERY_LIMIT } from '@app/common';
+import {
+  AGENT_DLQS,
+  AgentType,
+  DELIVERY_LIMIT,
+  jobEpochKey,
+  withHeartbeat,
+} from '@app/common';
 import { AgentJobMessage } from './agent.consumer';
 import { AgentFailureRecorderService } from './agent-failure-recorder.service';
 
@@ -30,6 +38,7 @@ export class AgentDlqConsumer implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly config: ConfigService,
     private readonly failureRecorder: AgentFailureRecorderService,
+    @InjectRedis() private readonly redis: Redis,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -37,7 +46,10 @@ export class AgentDlqConsumer implements OnModuleInit, OnModuleDestroy {
       'RABBITMQ_URL',
       'amqp://codemind:codemind@localhost:5672',
     );
-    this.connection = await amqplib.connect(url);
+    // withHeartbeat, not the bare URL: this connection bypasses the Nest
+    // transport factory, so it would otherwise silently keep the server's 60s
+    // default while every other connection in the process uses 30s.
+    this.connection = await amqplib.connect(withHeartbeat(url));
     this.channel = await this.connection.createChannel();
     await this.channel.prefetch(1);
 
@@ -60,6 +72,24 @@ export class AgentDlqConsumer implements OnModuleInit, OnModuleDestroy {
         data: AgentJobMessage;
       };
       const { jobId, repoPath } = envelope.data;
+
+      // Same fence as AgentConsumer.handle, for the same reason. A message that
+      // burned its 3 deliveries during run 0 can land here *after* a force-retry
+      // started run 1. `recordInfraFailure` SADDs into `job:{id}:agents_done`,
+      // which is scoped by jobId and shared across runs — so a stale DLQ message
+      // would advance the *live* run's completion count and could trip synthesis
+      // before run 1's agents have finished. It also rm -rf's the repoPath it was
+      // handed. Drop it: the run it belonged to is gone and nothing is waiting.
+      const currentEpoch = Number(
+        (await this.redis.get(jobEpochKey(jobId))) ?? 0,
+      );
+      if ((envelope.data.epoch ?? 0) !== currentEpoch) {
+        this.logger.warn(
+          `[${agentType}] dropping dead-lettered message from superseded run ` +
+            `(msg epoch ${envelope.data.epoch ?? 0} != current ${currentEpoch}) [job=${jobId}]`,
+        );
+        return;
+      }
 
       this.logger.warn(
         `[${agentType}] exhausted delivery-limit (${DELIVERY_LIMIT}) [job=${jobId}] — recording permanent failure`,

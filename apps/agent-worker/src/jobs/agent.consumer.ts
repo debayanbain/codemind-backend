@@ -18,6 +18,13 @@ import {
   jobReadyForSynthesisChannel,
   jobTokensUsedKey,
   jobEpochKey,
+  runKeyOf,
+  noTokens,
+  totalTokens,
+  Prisma,
+  RepoFacts,
+  jobRepoFactsKey,
+  EpochFencedError,
 } from '@app/common';
 
 import { ArchitectureAgent } from '../agents/architecture.agent';
@@ -30,7 +37,7 @@ import { AgentFailureRecorderService } from './agent-failure-recorder.service';
 
 export interface AgentJobMessage {
   jobId: string;
-  repoPath: string; // /tmp/repos/{jobId}/ — extracted tarball
+  repoPath: string; // /tmp/repos/{jobId}-{epoch}/ — this run's extracted tarball
   agentType: AgentType;
   totalAgents: number; // informational only — completion is decided via Redis agents_expected
   epoch?: number; // run generation; message is dropped if it doesn't match Redis job:{id}:epoch
@@ -142,10 +149,17 @@ export class AgentConsumer {
         return;
       }
 
-      // Step 0: cost cap (Phase 4). Checked before every LLM call, not after —
-      // once the shared per-job counter crosses budget, agents still queued
-      // behind this one skip the call entirely instead of adding more spend.
-      const budget = this.config.get<number>('JOB_TOKEN_BUDGET', 100_000);
+      // Step 0: cost cap. This job-wide check is a *secondary* gate and always
+      // has been a weak one: all five agents dispatch at once and all five read
+      // ~0 here at t=0, so it has never actually fenced a concurrent agent —
+      // only a retry or a late redelivery. The cap that really bounds spend is
+      // the per-agent one enforced inside the loop, which needs no Redis and so
+      // has no race.
+      const budget = this.config.get<number>('JOB_TOKEN_BUDGET', 500_000);
+      const agentBudget = this.config.get<number>(
+        'AGENT_TOKEN_BUDGET',
+        120_000,
+      );
       const spent = Number(
         (await this.redis.get(jobTokensUsedKey(jobId))) ?? 0,
       );
@@ -159,7 +173,7 @@ export class AgentConsumer {
           agentType,
           jobId,
           output: {},
-          tokensUsed: { input: 0, output: 0 },
+          tokensUsed: noTokens(),
           success: false,
           error: `Job token budget exceeded (${spent}/${budget})`,
           durationMs: 0,
@@ -170,21 +184,52 @@ export class AgentConsumer {
         const cg = await this.codeGraphService.openReadOnly(repoPath, jobId);
 
         // Step 2: agent-specific semantic query -> only relevant nodes returned.
+        // Cache scope is the runKey, not the jobId: the context is derived from
+        // this checkout's graph and the entry outlives the run (24h TTL).
         const graphContext = await this.codeGraphService.buildContext(
           cg,
           this.queryFor(agentType),
-          jobId,
+          runKeyOf(jobId, msg.epoch),
           agentType,
           20, // max nodes = hard cap on context size
         );
 
-        // Step 3: run the agent.
-        result = await run({ jobId, repoPath, graphContext });
+        // Step 3: load the orchestrator's zero-LLM ground truth and run the
+        // agent. Facts are best-effort — a missing key means a degraded prompt,
+        // not a failed job, and the agent still has the graph context.
+        const facts = await this.loadFacts(runKeyOf(jobId, msg.epoch));
+        result = await run({
+          jobId,
+          repoPath,
+          graphContext,
+          facts,
+          tools: { cg, repoPath },
+          agentTokenBudget: agentBudget,
+          checkAlive: () => this.assertNotFenced(jobId, msg.epoch),
+          onActivity: ({ turn, maxTurns, activity }) => {
+            // Fire-and-forget. `job:progress` only fires when an agent
+            // *finishes*; with a minute-scale loop that left the UI showing
+            // five running agents and no movement, which reads as hung. This is
+            // the missing heartbeat. Dropping one costs the UI ~3s (it polls
+            // underneath) — blocking the loop on it would cost far more.
+            const event: JobEventPayload = {
+              type: 'job:agent_activity',
+              jobId,
+              agentType,
+              turn,
+              maxTurns,
+              activity,
+            };
+            void this.redis
+              .publish(jobEventsChannel(jobId), JSON.stringify(event))
+              .catch(() => undefined);
+          },
+        });
 
         if (result.success) {
           await this.redis.incrby(
             jobTokensUsedKey(jobId),
-            result.tokensUsed.input + result.tokensUsed.output,
+            totalTokens(result.tokensUsed),
           );
         }
       }
@@ -197,7 +242,7 @@ export class AgentConsumer {
           jobId,
           agentType,
           rawOutput: result.output,
-          tokensUsed: result.tokensUsed,
+          tokensUsed: result.tokensUsed as unknown as Prisma.InputJsonValue,
           status: result.success ? 'success' : 'failed',
           durationMs: result.durationMs,
           error: result.error ?? null,
@@ -229,7 +274,9 @@ export class AgentConsumer {
       );
 
       if (doneCount >= expectedCount) {
-        this.codeGraphService.close(jobId);
+        // Close by path, not jobId — the same key openReadOnly used, so a
+        // superseded run can never close the live run's handle.
+        this.codeGraphService.close(repoPath);
         // Last agent standing deletes the extracted repo + its CodeGraph
         // SQLite DB (lives under repoPath/.codegraph) — otherwise every
         // completed job leaks a full checkout on disk indefinitely.
@@ -244,6 +291,17 @@ export class AgentConsumer {
 
       channel.ack(originalMsg);
     } catch (err: unknown) {
+      // A fence trip mid-loop is not a failure of this agent — it's a run the
+      // user abandoned. Write nothing, do NOT SADD into agents_done (that would
+      // advance completion for the *live* run and could fire synthesis early),
+      // and ack so the message leaves the queue for good. Same semantics as the
+      // pre-flight fence above; the only difference is how far in we got.
+      if (err instanceof EpochFencedError) {
+        this.logger.warn(`[${agentType}] aborted mid-run — ${err.message}`);
+        channel.ack(originalMsg);
+        return;
+      }
+
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`[${agentType}] fatal error job=${jobId}: ${message}`);
       // An infra failure here (graph open, buildContext, Postgres write) means
@@ -259,6 +317,42 @@ export class AgentConsumer {
           );
         });
       channel.nack(originalMsg, false, false);
+    }
+  }
+
+  /**
+   * The per-turn fence. One Redis GET against a local Redis is ~0.2ms, against
+   * a multi-second LLM call — free, next to the cost of not checking.
+   */
+  private async assertNotFenced(
+    jobId: string,
+    msgEpoch: number | undefined,
+  ): Promise<void> {
+    const current = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
+    if ((msgEpoch ?? 0) !== current) {
+      throw new EpochFencedError(jobId, msgEpoch ?? 0, current);
+    }
+  }
+
+  /**
+   * Read the run's AST ground truth, written by the orchestrator after
+   * indexing. Deliberately non-fatal: if it's missing or unparseable the agent
+   * runs without it and produces a weaker analysis, which beats failing a job
+   * over a cache read.
+   */
+  private async loadFacts(runKey: string): Promise<RepoFacts | undefined> {
+    try {
+      const raw = await this.redis.get(jobRepoFactsKey(runKey));
+      if (!raw) {
+        this.logger.warn(`No repo_facts for run=${runKey} — degraded prompt`);
+        return undefined;
+      }
+      return JSON.parse(raw) as RepoFacts;
+    } catch (e: unknown) {
+      this.logger.warn(
+        `Failed to read repo_facts for run=${runKey}: ${String(e)}`,
+      );
+      return undefined;
     }
   }
 

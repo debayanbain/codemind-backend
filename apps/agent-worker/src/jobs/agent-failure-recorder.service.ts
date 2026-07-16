@@ -12,6 +12,8 @@ import {
   jobAgentsExpectedKey,
   jobEventsChannel,
   jobReadyForSynthesisChannel,
+  noTokens,
+  Prisma,
 } from '@app/common';
 
 /**
@@ -44,7 +46,7 @@ export class AgentFailureRecorderService {
         jobId,
         agentType,
         rawOutput: {},
-        tokensUsed: { input: 0, output: 0 },
+        tokensUsed: noTokens() as unknown as Prisma.InputJsonValue,
         status: 'failed',
         durationMs: null,
         error: message,
@@ -70,7 +72,8 @@ export class AgentFailureRecorderService {
     );
 
     if (doneCount >= expectedCount) {
-      this.codeGraphService.close(jobId);
+      // Close by path — the key openReadOnly used. See CodeGraphService.
+      this.codeGraphService.close(repoPath);
       await fs
         .rm(repoPath, { recursive: true, force: true })
         .catch((e: unknown) => {

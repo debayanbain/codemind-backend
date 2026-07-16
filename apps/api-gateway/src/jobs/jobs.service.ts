@@ -15,6 +15,12 @@ import {
   RenderedDiagram,
   SonnetSynthesisOutput,
   AgentType,
+  TokenUsage,
+  noTokens,
+  totalTokens,
+  agentModel,
+  estimateCostUsd,
+  formatUsd,
   ANALYSIS_REQUESTED_QUEUE,
   jobStatusKey,
   jobAgentsDoneKey,
@@ -38,7 +44,17 @@ export interface AgentResultSummary {
    * Null on a failed agent run.
    */
   rawOutput: unknown;
-  tokensUsed: { input: number; output: number };
+  /**
+   * All four token classes, as stored. `input` is only the **uncached**
+   * remainder — with prompt caching on, most of a loop's input arrives as
+   * `cacheRead`, so a client that adds `input + output` under-reports real spend
+   * by a wide margin and gets more wrong the better caching works.
+   *
+   * `totalTokens` is served alongside precisely so no client has to know that.
+   */
+  tokensUsed: TokenUsage;
+  /** Total tokens processed — the number to display. */
+  totalTokens: number;
   durationMs: number | null;
 }
 
@@ -53,6 +69,20 @@ export interface ReportPayload {
   /** Null for reports written before synthesis was persisted structurally. */
   synthesis: SonnetSynthesisOutput | null;
   totalTokens: number;
+  /**
+   * What this job cost, computed server-side.
+   *
+   * Served rather than left to the client because the client had its own copy of
+   * the pricing math, commented "kept identical so the dashboard and the
+   * Markdown agree" — and it wasn't identical, it was wrong, and fixing the
+   * renderer made the two disagree on screen. Two copies that must agree are one
+   * copy that hasn't been written yet.
+   */
+  estimatedCostUsd: number;
+  /** Pre-formatted (`$0.576`) so every surface renders it the same way. */
+  estimatedCostLabel: string;
+  /** The model the figure above prices. */
+  model: string;
 }
 
 export interface JobWithReport extends Job {
@@ -82,6 +112,11 @@ export class JobsService {
         jobId: job.id,
         userId,
         repoFullName,
+        // Freshly-created job — nothing has bumped `job:{id}:epoch` yet, so
+        // this run is generation 0. Stamped rather than left undefined so the
+        // orchestrator can fence this message if a force-stop supersedes it
+        // before it's consumed.
+        epoch: 0,
       }),
     );
 
@@ -175,6 +210,9 @@ export class JobsService {
         userId,
         repoFullName: job.repoFullName,
         retryAgentTypes,
+        // Retry re-runs the *current* generation — it doesn't fence anything,
+        // so carry the epoch as it stands rather than bumping it.
+        epoch: Number((await this.redis.get(jobEpochKey(jobId))) ?? 0),
       }),
     );
 
@@ -200,7 +238,10 @@ export class JobsService {
     }
 
     // Fence first, so nothing from the old run survives the state wipe below.
-    await this.redis.incr(jobEpochKey(jobId));
+    // INCR returns the new generation — carry it on the message below so the
+    // orchestrator can drop any still-queued message from the superseded run
+    // instead of running it concurrently against the same checkout.
+    const epoch = await this.redis.incr(jobEpochKey(jobId));
 
     // Clear per-run state; the orchestrator repopulates agents_expected +
     // graph_path on the fresh run.
@@ -224,6 +265,7 @@ export class JobsService {
         jobId,
         userId,
         repoFullName: job.repoFullName,
+        epoch,
       }),
     );
 
@@ -247,6 +289,7 @@ export class JobsService {
     const latestByType = new Map<AgentType, AgentResultSummary>();
     for (const row of rows) {
       if (latestByType.has(row.agentType)) continue;
+      const usage = (row.tokensUsed as TokenUsage | null) ?? noTokens();
       latestByType.set(row.agentType, {
         agentType: row.agentType,
         status: row.status,
@@ -254,10 +297,8 @@ export class JobsService {
         // A failed agent's rawOutput is `{}` — surface it as absent, not as an
         // empty object the frontend would render as a section with no findings.
         rawOutput: row.status === 'success' ? row.rawOutput : null,
-        tokensUsed: (row.tokensUsed ?? { input: 0, output: 0 }) as {
-          input: number;
-          output: number;
-        },
+        tokensUsed: usage,
+        totalTokens: totalTokens(usage),
         durationMs: row.durationMs,
       });
     }
@@ -267,10 +308,17 @@ export class JobsService {
 
 /** Report row -> API payload. Shared by the owner and share-link read paths. */
 export function toReportPayload(report: Report): ReportPayload {
+  const model = agentModel();
+  const usd = estimateCostUsd(report.totalTokens, model);
   return {
     markdownContent: report.markdownContent,
     diagrams: (report.diagrams ?? []) as unknown as RenderedDiagram[],
     synthesis: (report.synthesis ?? null) as SonnetSynthesisOutput | null,
     totalTokens: report.totalTokens,
+    // Computed here, by the same helper the Markdown uses, so the dashboard and
+    // the report can't drift apart.
+    estimatedCostUsd: usd,
+    estimatedCostLabel: formatUsd(usd),
+    model,
   };
 }

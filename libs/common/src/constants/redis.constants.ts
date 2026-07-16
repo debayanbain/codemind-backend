@@ -18,11 +18,36 @@ export const jobAgentsExpectedKey = (jobId: string) =>
 // prematurely tripping completion tracking. Unset == generation 0.
 export const jobEpochKey = (jobId: string) => `job:${jobId}:epoch`;
 
+// A job's *run* identity: `{jobId}-{epoch}`. The orchestrator extracts each run
+// to /tmp/repos/{runKey}, so a force-stop (which INCRs the epoch) produces a
+// genuinely different checkout and graph. Anything scoped to the contents of a
+// checkout must key on this, not on jobId alone — otherwise a retry reads the
+// abandoned run's data back. Unset epoch == generation 0, matching jobEpochKey.
+export const runKeyOf = (jobId: string, epoch: number | undefined) =>
+  `${jobId}-${epoch ?? 0}`;
+
+// Section 6's `agent_context:{jobId}:{agentType}:{queryHash}` — with the first
+// slot widened from jobId to runKey. The cached value is derived from one
+// specific checkout's graph and lives for 24h, so a bare jobId served run 1 the
+// context built from run 0. See runKeyOf above.
 export const agentContextKey = (
-  jobId: string,
+  runKey: string,
   agentType: string,
   queryHash: string,
-) => `agent_context:${jobId}:${agentType}:${queryHash}`;
+) => `agent_context:${runKey}:${agentType}:${queryHash}`;
+
+// Zero-LLM ground truth about a run's checkout: real routes, real module edges,
+// measured complexity, framework detection, counts. Written once by the
+// orchestrator after indexing, read by every agent.
+//
+// Not in Section 6's original table — an addition, not a rename. It follows the
+// `job:{id}:graph_path` precedent (orchestrator computes, worker reads) rather
+// than riding in the dispatch message, because ClientProxy copies the payload
+// once per agent and the DLQ consumer parses the whole envelope for two fields.
+//
+// Keyed by runKey, not jobId: these facts describe one specific checkout, and
+// the 24h TTL outlives the run that produced them.
+export const jobRepoFactsKey = (runKey: string) => `job:${runKey}:repo_facts`;
 
 export const jobSubmitRateLimitKey = (userId: string) =>
   `ratelimit:job_submit:${userId}`;

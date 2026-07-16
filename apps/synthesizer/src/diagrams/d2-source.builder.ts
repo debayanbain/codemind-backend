@@ -55,7 +55,13 @@ export class D2SourceBuilder {
     const lines = ['direction: right'];
 
     for (const m of [...nodeSet].slice(0, D2SourceBuilder.MAX_MODULES)) {
-      lines.push(this.node(ids.get(m), m, hasIncoming.has(m) ? undefined : PALETTE.entry));
+      lines.push(
+        this.node(
+          ids.get(m),
+          m,
+          hasIncoming.has(m) ? undefined : PALETTE.entry,
+        ),
+      );
     }
     for (const { from, to, label } of deps.slice(
       0,

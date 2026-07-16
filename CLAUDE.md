@@ -80,7 +80,8 @@ runtime dependencies and don't need independent scaling for this project's scale
      with routing keys `agent.architecture`, `agent.security`, `agent.dependencies`,
      `agent.quality`, `agent.docs`.
    - Updates job status to `running`, emits Socket.io `job:status` event.
-6. `agent-worker` has one queue bound per routing key, `prefetch: 1` each. On each
+6. `agent-worker` has one queue bound per routing key, `prefetch: 3` each (see
+   Section 11 — this was 1, and the stated rationale was backwards). On each
    message:
    - Reads `job:{id}:graph_path` from Redis, opens the SQLite DB read-only (WAL mode
      allows concurrent reads).
@@ -122,8 +123,21 @@ runtime dependencies and don't need independent scaling for this project's scale
 | `job:{id}:graph_path` | string | path to the SQLite CodeGraph DB for this job |
 | `job:{id}:agents_done` | set | which agent types have completed |
 | `job:{id}:agents_expected` | int (or set) | which agents orchestrator dispatched, to know when synthesizer should fire |
-| `agent_context:{jobId}:{agentType}:{queryHash}` | string (JSON) | cached `buildContext` LLM result, TTL e.g. 24h |
+| `agent_context:{runKey}:{agentType}:{queryHash}` | string (JSON) | cached `buildContext` result, TTL 24h |
+| `job:{runKey}:repo_facts` | string (JSON) | zero-LLM AST ground truth for this run, TTL 24h |
 | rate limit key per user | string w/ TTL | cap job submissions per user per time window |
+
+**`runKey` = `{jobId}-{epoch}`.** Anything scoped to the *contents of a checkout*
+must key on the run, not the job. A force-stop `INCR`s `job:{id}:epoch` and the
+orchestrator extracts a genuinely different checkout to `/tmp/repos/{runKey}`;
+with a bare jobId and a 24h TTL, run 1 read back run 0's abandoned data and
+nothing ever errored. Keys about the *job* (status, completion, budget, epoch)
+stay keyed by jobId — those legitimately span runs.
+
+`job:{runKey}:repo_facts` is an addition to this table, not a rename. It follows
+the `graph_path` precedent — orchestrator computes, workers read — rather than
+riding in the dispatch message, because `ClientProxy` copies the payload once per
+agent and the DLQ consumer parses the whole envelope to read two fields.
 
 ## 7. Postgres schema
 
@@ -138,10 +152,41 @@ Token usage per agent run is mandatory, not optional — this is your answer to 
 you control LLM cost in production," and it's how you avoid a runaway bill during a
 live demo.
 
-## 8. Agent design — exact per-agent CodeGraph queries
+## 8. Agent design — a bounded evidence loop per agent
 
-Do not give every agent the same `buildContext` call. Each agent gets a targeted
-semantic query so its LLM call only sees relevant code:
+> **Superseded (approved deviation).** This section originally specified one
+> `buildContext` call and one LLM call per agent. That is why the reports read
+> like a filled-in form: an agent got 20 nodes chosen before it had seen
+> anything, and could not ask a single follow-up about code it had just read.
+> Each agent is now a **bounded tool-use loop** over the code graph. The
+> per-agent seed queries below still apply — they're the loop's starting point,
+> not its only input.
+>
+> **This is not a ReAct chain across agents, and the distinction is the point.**
+> The five analyses stay independent and still fan out over the topic exchange;
+> nothing security learns changes what docs should look at. What changed is
+> *inside* one agent, where the work genuinely is sequential-with-feedback.
+>
+> The loop is hand-rolled (~120 lines in `base.agent.ts`) — not the SDK's Tool
+> Runner, not a framework. Section 2's ban stands.
+>
+> Mechanics that are load-bearing:
+> - **Tools are read-only** and every result carries `file:line`. A claim the
+>   agent can't point at is a claim the report can't make.
+> - **A throwing tool is not a failure** — it returns `is_error: true` and the
+>   model recovers. Killing a run over a bad node id would discard every turn
+>   already paid for.
+> - **All parallel tool results go back in ONE user message.** Splitting them
+>   silently trains the model out of parallel calls.
+> - **Turn and token caps, with a forced finish.** On the last affordable turn
+>   the `emit_*` tool is forced, so "out of turns" and "out of budget" both yield
+>   a real if narrower analysis (marked `truncated`) instead of nothing.
+> - **The fence is re-checked every turn** (`EpochFencedError`), because a
+>   force-stop mid-loop otherwise burns minutes of tokens on an abandoned run.
+> - **Facts before search.** Anything the AST already knows arrives from the
+>   RepoFacts pre-pass (Section 6). The loop is for what the AST *can't* say.
+
+Each agent gets a targeted seed query so its first turn starts somewhere useful:
 
 - **Architecture agent**: `buildContext('entry points main module bootstrap dependency injection controllers services', { maxNodes: 15, includeCode: true })` + `cg.files()` for directory structure (no LLM cost). Output includes `module_dependencies[]` (from/to pairs) and `request_flows[]` (ordered steps) — these feed Mermaid diagrams directly.
 - **Security agent**: `cg.searchNodes('auth jwt token password hash encrypt')` → `cg.getCallers(...)` on top hits → `buildContext('authentication authorization input validation sql injection user input', { maxNodes: 15, includeCode: true })`. Output includes `auth_flow_steps[]` and `vulnerabilities[]`.
@@ -249,8 +294,17 @@ synthesizer already produced — it needs the strings, not the renderer.
 
 - One topic exchange: `agents.topic`
 - Routing keys: `agent.architecture`, `agent.security`, `agent.dependencies`, `agent.quality`, `agent.docs`
-- One queue per agent type, bound to its routing key, `prefetch: 1` (so one slow LLM
-  call doesn't block other messages of the same type from other jobs)
+- One queue per agent type, bound to its routing key, `prefetch: 3`. **Corrected:**
+  this said `prefetch: 1`, "so one slow LLM call doesn't block other messages of
+  the same type from other jobs". It does the opposite — one unacked message per
+  consumer is exactly that blocking, and job B waits for job A to ack. Invisible
+  at 5s per agent; minutes of dead air now that an agent is a tool loop. 3 is safe
+  because the loop is I/O-bound on the LLM; not higher, because each in-flight
+  agent holds a graph handle and a growing conversation, and unacked messages are
+  re-run on a crash.
+- Heartbeat pinned at 30s on every AMQP connection. CodeGraph reads are synchronous
+  and share amqplib's event loop; a long sync run misses beats, drops the
+  connection, and gets the message redelivered — 3x the tokens and still a failure.
 - Separate simple queue for `analysis.requested` -> orchestrator
 - Separate queue/event for `report.ready` if synthesizer and api-gateway are decoupled
 
@@ -292,16 +346,27 @@ synthesizer already produced — it needs the strings, not the renderer.
 - "I didn't send full files to the LLM. I pre-built a code knowledge graph via
   tree-sitter AST parsing — zero LLM cost — then agents queried it with targeted
   semantic questions and got back only relevant nodes."
-- "I used orchestrator-worker instead of a ReAct loop because the five analysis
-  subtasks are independent, not sequential-with-feedback."
+- "The fan-out isn't a loop; each agent is. Different axes. The five analyses are
+  independent, so they fan out over a topic exchange rather than chaining — but
+  inside one agent the work is exactly sequential-with-feedback, because you
+  can't know which symbol to read next until you've read the last one. So each
+  agent is a bounded evidence loop over the graph, and the dispatch between them
+  still isn't."
 - "One agent-worker process with multiple queue consumers, not five separate
   microservices — decoupled via RabbitMQ routing keys, but doesn't need independent
   deployment/scaling at this project's scale."
 - "Token usage is tracked per agent run in Postgres specifically so cost is
   measurable and cappable, not just 'trust me it's cheap.'"
-- "Diagrams are generated from structured agent JSON in plain TypeScript, not
-  written by the LLM, so they can't hallucinate relationships that don't exist
-  in the code."
+- "Diagrams are generated in plain TypeScript, not written by the LLM. The module
+  graph is built from `getFileDependencies` aggregated to module level — real
+  imports, weighted — so it can't express an edge that isn't in the code. Worth
+  being precise here: that was *aspirational* until the RepoFacts pre-pass landed,
+  because diagram #1 was drawn from an LLM-invented `module_dependencies[]`. The
+  claim is only true because the facts moved out of the model."
+- "Anything the AST already knows, the model never gets asked. Framework, entry
+  points, routes, module edges, complexity hotspots, cycles, dead code — all
+  computed once, zero LLM, and handed to the agents as ground truth. A fact the
+  graph has is a fact a model shouldn't be invited to guess at."
 - "I render D2 to SVG server-side, at report-build time. Mermaid only renders in
   a browser, so the PDF exporter had to inject a CDN script and hope Puppeteer
   executed it before capture — a race that fails silently into raw code blocks.

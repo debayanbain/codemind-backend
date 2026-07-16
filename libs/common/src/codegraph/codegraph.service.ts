@@ -22,55 +22,90 @@ import { agentContextKey } from '../constants/redis.constants';
  *    separate process (WAL mode allows concurrent readers), since the
  *    orchestrator's in-process instance isn't visible across processes.
  *
- * Each process keeps its own small in-memory cache keyed by jobId so the 5
- * agent handlers in agent-worker share one open handle per job instead of
- * re-opening the DB per agent.
+ * Each process keeps its own small in-memory cache so the 5 agent handlers in
+ * agent-worker share one open handle per run instead of re-opening the DB per
+ * agent.
+ *
+ * The cache key is the **repo path**, never the jobId. A force-stop bumps
+ * `job:{id}:epoch` and the orchestrator extracts the new run to
+ * `/tmp/repos/{jobId}-{epoch}` — a different directory holding a different
+ * graph. Keying by jobId meant run 1's agents hit the cache and silently
+ * queried run 0's abandoned index, producing a report for a checkout the user
+ * had already replaced. Keying by the path makes that unrepresentable: the key
+ * is the identity of the thing being opened.
+ *
+ * Values are the in-flight *promise*, not the resolved handle. Five consumers
+ * reach this concurrently; a check-then-await gap let all five miss the cache,
+ * open five handles, and leak four.
  */
 @Injectable()
 export class CodeGraphService implements OnModuleDestroy {
   private readonly logger = new Logger(CodeGraphService.name);
-  private readonly graphs = new Map<string, CodeGraph>();
+  private readonly graphs = new Map<string, Promise<CodeGraph>>();
 
   constructor(@InjectRedis() private readonly redis: Redis) {}
 
-  async initAndIndex(repoPath: string, jobId: string): Promise<CodeGraph> {
-    if (this.graphs.has(jobId)) return this.graphs.get(jobId)!;
+  initAndIndex(repoPath: string, jobId: string): Promise<CodeGraph> {
+    const existing = this.graphs.get(repoPath);
+    if (existing) return existing;
 
     this.logger.log(`Indexing repo [job=${jobId}] path=${repoPath}`);
     const t = Date.now();
 
-    const cg = await CodeGraph.init(repoPath);
-    const result = await cg.indexAll();
+    const indexing = (async () => {
+      const cg = await CodeGraph.init(repoPath);
+      const result = await cg.indexAll();
+      this.logger.log(
+        `Graph ready in ${Date.now() - t}ms [job=${jobId}] files=${result.filesIndexed ?? '?'}`,
+      );
+      return cg;
+    })().catch((e: unknown) => {
+      // Never cache a rejection — a transient index failure would otherwise
+      // poison every later open of this path for the process's lifetime.
+      this.graphs.delete(repoPath);
+      throw e;
+    });
 
-    this.graphs.set(jobId, cg);
-    this.logger.log(
-      `Graph ready in ${Date.now() - t}ms [job=${jobId}] files=${result.filesIndexed ?? '?'}`,
-    );
-    return cg;
+    this.graphs.set(repoPath, indexing);
+    return indexing;
   }
 
-  async openReadOnly(repoPath: string, jobId: string): Promise<CodeGraph> {
-    if (this.graphs.has(jobId)) return this.graphs.get(jobId)!;
+  openReadOnly(repoPath: string, jobId: string): Promise<CodeGraph> {
+    const existing = this.graphs.get(repoPath);
+    if (existing) return existing;
 
-    const cg = await CodeGraph.open(repoPath, { readOnly: true });
-    this.graphs.set(jobId, cg);
-    return cg;
+    this.logger.debug(
+      `Opening graph read-only [job=${jobId}] path=${repoPath}`,
+    );
+    const opening = CodeGraph.open(repoPath, { readOnly: true }).catch(
+      (e: unknown) => {
+        this.graphs.delete(repoPath);
+        throw e;
+      },
+    );
+
+    this.graphs.set(repoPath, opening);
+    return opening;
   }
 
   /**
-   * buildContext with Redis cache keyed by (jobId, agentType, query hash) —
-   * Section 6's `agent_context:{jobId}:{agentType}:{queryHash}`. If two
-   * agents (or a re-run) issue the same query, skip the LLM-adjacent
-   * formatting work and reuse the cached markdown context. TTL: 24h.
+   * buildContext with Redis cache keyed by (runKey, agentType, query hash) —
+   * Section 6's `agent_context:{jobId}:{agentType}:{queryHash}`, with the
+   * jobId slot widened to `{jobId}-{epoch}`. If two agents issue the same
+   * query, skip the formatting work and reuse the cached markdown. TTL: 24h.
+   *
+   * The scope must be the runKey, not the jobId, for the same reason the
+   * handle cache is keyed by path: with a bare jobId and a 24h TTL, a
+   * force-retry served run 1 the context built from run 0's graph.
    */
   async buildContext(
     cg: CodeGraph,
     query: string,
-    jobId: string,
+    runKey: string,
     agentType: string,
     maxNodes = 20,
   ): Promise<string> {
-    const key = agentContextKey(jobId, agentType, this.hash(query));
+    const key = agentContextKey(runKey, agentType, this.hash(query));
     const hit = await this.redis.get(key);
     if (hit) {
       this.logger.debug(
@@ -114,17 +149,32 @@ export class CodeGraphService implements OnModuleDestroy {
     return cg.getStats();
   }
 
-  /** Close and evict one job's graph handle (called once all agents for that job are done). */
-  close(jobId: string): void {
-    const cg = this.graphs.get(jobId);
-    if (!cg) return;
-    cg.close();
-    this.graphs.delete(jobId);
+  /**
+   * Close and evict one run's graph handle (called once all agents for that
+   * run are done). Takes the repo path — the same key `openReadOnly` used, so
+   * a stale run can never close the live run's handle.
+   */
+  close(repoPath: string): void {
+    const opening = this.graphs.get(repoPath);
+    if (!opening) return;
+    this.graphs.delete(repoPath);
+    // The handle may still be opening; close it whenever it lands. Swallow the
+    // rejection — a graph that failed to open has nothing to close.
+    void opening.then(
+      (cg) => cg.close(),
+      () => undefined,
+    );
   }
 
-  onModuleDestroy() {
-    for (const cg of this.graphs.values()) cg.close();
+  async onModuleDestroy() {
+    const closing = [...this.graphs.values()].map((p) =>
+      p.then(
+        (cg) => cg.close(),
+        () => undefined,
+      ),
+    );
     this.graphs.clear();
+    await Promise.allSettled(closing);
   }
 
   private hash(s: string): string {

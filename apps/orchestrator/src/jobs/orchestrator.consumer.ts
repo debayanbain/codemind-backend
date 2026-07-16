@@ -14,6 +14,7 @@ import {
   jobAgentsExpectedKey,
   jobEpochKey,
   jobEventsChannel,
+  jobRepoFactsKey,
 } from '@app/common';
 
 import {
@@ -23,6 +24,7 @@ import {
 import { RepoManifestService } from '../manifest/repo-manifest.service';
 import { AgentDispatchService } from '../dispatch/agent-dispatch.service';
 import { JobFailureRecorderService } from './job-failure-recorder.service';
+import { RepoFactsService } from '../facts/repo-facts.service';
 
 export interface AnalysisRequestedMessage {
   jobId: string;
@@ -37,6 +39,21 @@ export interface AnalysisRequestedMessage {
    * responsible for SREM-ing these types out of `agents_done` first.
    */
   retryAgentTypes?: AgentType[];
+  /**
+   * The value of `job:{id}:epoch` when this message was published — NOT when it
+   * is consumed. Force-stop-and-retry INCRs the epoch and republishes, so the
+   * superseded message is still sitting in the queue. Reading the epoch at
+   * consume time gave both messages the *current* value, so both resolved the
+   * same runKey, extracted to the same `/tmp/repos/{runKey}` and wrote the same
+   * `{runKey}.tar.gz` concurrently — corrupting each other's gzip
+   * ("invalid stored block lengths") and deleting the archive out from under
+   * each other on cleanup. Stamping it at publish is what lets the consumer
+   * tell a superseded run from the live one, the same way agents are fenced.
+   *
+   * Optional: messages published before this field existed carry no epoch and
+   * fall back to the consume-time read.
+   */
+  epoch?: number;
 }
 
 interface AckableChannel {
@@ -57,6 +74,7 @@ export class OrchestratorConsumer {
     private readonly manifestService: RepoManifestService,
     private readonly dispatchService: AgentDispatchService,
     private readonly failureRecorder: JobFailureRecorderService,
+    private readonly repoFactsService: RepoFactsService,
   ) {}
 
   @EventPattern(ANALYSIS_REQUESTED_QUEUE)
@@ -68,6 +86,20 @@ export class OrchestratorConsumer {
     const originalMsg = ctx.getMessage();
     const { jobId, userId, repoFullName, retryAgentTypes } = msg;
     const isRetry = !!retryAgentTypes?.length;
+
+    // Fence before any work: a force-stop bumped the epoch and republished, so
+    // this message may belong to a run that has already been abandoned. Drop it
+    // rather than let it race the live run over the same checkout. Ack, don't
+    // nack — the message isn't failed, it's obsolete; nacking would DLQ it and
+    // mark a job that is currently running as failed.
+    const currentEpoch = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
+    if (msg.epoch !== undefined && msg.epoch !== currentEpoch) {
+      this.logger.warn(
+        `Dropping superseded analysis.requested [job=${jobId}] — message epoch ${msg.epoch}, current ${currentEpoch}`,
+      );
+      channel.ack(originalMsg);
+      return;
+    }
 
     this.logger.log(
       `Received analysis.requested for ${repoFullName} [job=${jobId}]${
@@ -88,8 +120,9 @@ export class OrchestratorConsumer {
       // The run epoch (bumped by force-stop-and-retry) both fences stale
       // in-flight agent messages AND keys this run's repo directory, so a late
       // straggler from a superseded run can't delete the folder this run just
-      // indexed. Read it up front — it names the checkout dir. Unset == gen 0.
-      const epoch = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
+      // indexed. Taken from the fence check above, which prefers the epoch
+      // stamped at publish time. Unset == gen 0.
+      const epoch = msg.epoch ?? currentEpoch;
       const runKey = `${jobId}-${epoch}`;
 
       // Repo dir is always re-downloaded — the previous run's checkout +
@@ -103,8 +136,22 @@ export class OrchestratorConsumer {
       );
 
       // Pure AST parsing — zero LLM cost.
-      await this.codeGraphService.initAndIndex(repoPath, jobId);
+      const cg = await this.codeGraphService.initAndIndex(repoPath, jobId);
       await this.redis.set(jobGraphPathKey(jobId), repoPath);
+
+      // Everything the AST already knows: real routes, real module edges,
+      // measured complexity, framework detection, counts. Computed once here
+      // while the graph is hot rather than per-agent (the cycle and dead-code
+      // passes are full-graph traversals), and published for the workers to
+      // read. Still zero LLM cost — this is what stops the agents guessing at
+      // facts and lets them spend their tokens on judgment instead.
+      const facts = await this.repoFactsService.build(cg, repoPath, runKey);
+      await this.redis.set(
+        jobRepoFactsKey(runKey),
+        JSON.stringify(facts),
+        'EX',
+        86400,
+      );
 
       const manifest = await this.manifestService.build(repoPath);
 
@@ -118,7 +165,13 @@ export class OrchestratorConsumer {
         await this.redis.sadd(jobAgentsExpectedKey(jobId), ...agentTypes);
       }
 
-      this.dispatchService.dispatch(jobId, repoPath, agentTypes, manifest, epoch);
+      this.dispatchService.dispatch(
+        jobId,
+        repoPath,
+        agentTypes,
+        manifest,
+        epoch,
+      );
 
       this.logger.log(
         `Dispatched ${agentTypes.length} agent(s) for job=${jobId}: ${agentTypes.join(', ')}`,

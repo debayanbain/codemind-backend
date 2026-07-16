@@ -11,11 +11,35 @@ import {
   DELIVERY_LIMIT,
 } from '../constants/rabbitmq.constants';
 
+/**
+ * How often the broker and client exchange heartbeats, in seconds.
+ *
+ * This became load-bearing when agents became loops. amqplib sends heartbeats on
+ * the same event loop as everything else, and every CodeGraph read is
+ * *synchronous* (`node:sqlite`) — only `getCode` and file reads actually await.
+ * A long enough uninterrupted run of sync graph calls misses two heartbeats, the
+ * broker drops the connection, and the in-flight message is redelivered: the
+ * agent re-runs from scratch, three times, then dead-letters. You pay 3x the
+ * tokens and still get a failed agent.
+ *
+ * 30s (vs the server default of 60) fails faster and more predictably, and the
+ * tool loop yields via setImmediate between tool executions so the beats land.
+ * Pinning it on the URL means every connection in every service agrees.
+ */
+const HEARTBEAT_SECONDS = 30;
+
 function rabbitmqUrl(config: ConfigService): string {
-  return config.get<string>(
+  const base = config.get<string>(
     'RABBITMQ_URL',
     'amqp://codemind:codemind@localhost:5672',
   );
+  return withHeartbeat(base);
+}
+
+/** Add `heartbeat` to an AMQP URL unless it already specifies one. */
+export function withHeartbeat(url: string): string {
+  if (/[?&]heartbeat=/.test(url)) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}heartbeat=${HEARTBEAT_SECONDS}`;
 }
 
 /**
@@ -84,13 +108,33 @@ export function buildAgentTopicClientOptions(
 }
 
 /**
+ * How many messages one agent consumer may hold unacked at a time.
+ *
+ * This was 1, justified as "keeps head-of-line blocking off the table". It does
+ * the opposite: one unacked message per consumer is *precisely* head-of-line
+ * blocking. Job B's architecture agent cannot start until job A's has acked.
+ *
+ * At ~5s per agent that was invisible. Now that an agent is a tool loop running
+ * for a minute or more, two concurrent jobs meant the second user waited minutes
+ * before their first agent moved, with no progress event to explain the silence.
+ *
+ * 3 is safe because the loop is I/O-bound on the LLM — it spends its life
+ * awaiting HTTP, not burning CPU — so overlapping three costs almost nothing and
+ * they interleave on the event loop. It is deliberately not higher: each
+ * in-flight agent holds an open graph handle and a growing conversation in
+ * memory, and unacked messages are redelivered on a crash, so a big prefetch
+ * means a big re-run.
+ */
+const AGENT_PREFETCH = 3;
+
+/**
  * One of these per agent type — agent-worker calls `app.connectMicroservice()`
  * once per entry in AGENT_QUEUES so each gets its own channel and its own
- * `prefetch: 1`, matching Section 11's "one queue per agent type, prefetch: 1
- * each" (a shared queue would serialize all 5 agent types behind one prefetch
- * slot). Since `routingKey` is set (not `wildcards`), ServerRMQ binds exactly
- * one queue to exactly one routing key on the same `agents.topic` exchange the
- * publisher asserts.
+ * prefetch, matching Section 11's "one queue per agent type" (a shared queue
+ * would serialize all 5 agent types behind one prefetch slot). Since
+ * `routingKey` is set (not `wildcards`), ServerRMQ binds exactly one queue to
+ * exactly one routing key on the same `agents.topic` exchange the publisher
+ * asserts.
  */
 export function buildAgentQueueOptions(
   url: string,
@@ -99,7 +143,7 @@ export function buildAgentQueueOptions(
   return {
     transport: Transport.RMQ,
     options: {
-      urls: [url],
+      urls: [withHeartbeat(url)],
       queue: AGENT_QUEUES[agentType],
       queueOptions: {
         durable: true,
@@ -113,7 +157,7 @@ export function buildAgentQueueOptions(
       exchange: AGENTS_TOPIC_EXCHANGE,
       exchangeType: 'topic',
       routingKey: AGENT_ROUTING_KEYS[agentType],
-      prefetchCount: 1,
+      prefetchCount: AGENT_PREFETCH,
       isGlobalPrefetchCount: false,
       noAck: false,
     },

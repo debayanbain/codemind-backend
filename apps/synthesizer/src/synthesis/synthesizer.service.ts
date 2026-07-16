@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { InjectRedis } from '@nestjs-modules/ioredis';
 import Redis from 'ioredis';
 
@@ -14,18 +19,33 @@ import {
   jobAgentsExpectedKey,
   jobEventsChannel,
   jobSynthesizingLockKey,
+  jobEpochKey,
+  jobRepoFactsKey,
+  runKeyOf,
+  RepoFacts,
+  TokenUsage,
+  totalTokens,
 } from '@app/common';
 import { DiagramsService } from '../diagrams/diagrams.service';
 import { ReportRenderer } from '../report/report-renderer.service';
 
-const SONNET_MODEL = 'claude-sonnet-5';
+const SONNET_MODEL =
+  process.env.ANTHROPIC_SYNTHESIS_MODEL ?? 'claude-sonnet-4-6';
 const OPENAI_SYNTHESIS_MODEL = process.env.OPENAI_SYNTHESIS_MODEL ?? 'gpt-4o';
 
+/**
+ * How often to look for jobs whose wakeup was dropped. Long enough to be
+ * negligible (one indexed query + two SCARDs per running job), short enough
+ * that a lost message costs a wait, not the job.
+ */
+const SWEEP_INTERVAL_MS = 30_000;
+
 @Injectable()
-export class SynthesizerService implements OnModuleInit {
+export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SynthesizerService.name);
   private readonly client = new LlmClient();
   private subscriber: Redis;
+  private sweepTimer?: NodeJS.Timeout;
 
   constructor(
     @InjectRedis() private readonly redis: Redis,
@@ -50,6 +70,63 @@ export class SynthesizerService implements OnModuleInit {
     );
     await this.subscriber.psubscribe('job:*:ready_for_synthesis');
     this.logger.log('Synthesizer listening for completed jobs');
+
+    // Redis pub/sub has no durability: it delivers to whoever is connected at
+    // publish time and forgets. If this process is down for even a moment —
+    // OOM kill, redeploy, crash — the `ready_for_synthesis` for a job whose
+    // last agent just finished is delivered to nobody, and that job sits at
+    // "synthesizing" forever with every agent result already paid for and
+    // sitting in Postgres. That is exactly what happened.
+    //
+    // So pub/sub stays as the fast path (sub-second), and this sweep is the
+    // backstop that makes a missed wakeup recoverable rather than terminal.
+    // Section 7 explicitly allows "SCARD after each SADD, or a lightweight
+    // poll — your choice, document which you pick": this is both, and the
+    // reason for both is that the first one alone can drop the message.
+    await this.sweepStalledJobs();
+    this.sweepTimer = setInterval(() => {
+      this.sweepStalledJobs().catch((err: unknown) => {
+        this.logger.error('Stalled-job sweep failed', err);
+      });
+    }, SWEEP_INTERVAL_MS);
+    // Don't hold the event loop open on shutdown.
+    this.sweepTimer.unref();
+  }
+
+  onModuleDestroy(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+  }
+
+  /**
+   * Find jobs whose agents have all finished but which never got synthesized,
+   * and drive them. `synthesize()` is already idempotent — it claims a Redis
+   * lock and bails if a report exists — so a job picked up here that is
+   * genuinely in flight is a no-op, not a double Sonnet call.
+   */
+  private async sweepStalledJobs(): Promise<void> {
+    const running = await this.prisma.job.findMany({
+      where: { status: 'running' },
+      select: { id: true },
+    });
+
+    for (const { id: jobId } of running) {
+      try {
+        const [done, expected] = await Promise.all([
+          this.redis.scard(jobAgentsDoneKey(jobId)),
+          this.redis.scard(jobAgentsExpectedKey(jobId)),
+        ]);
+        // expected === 0 means the orchestrator hasn't dispatched yet — the job
+        // is early, not stalled.
+        if (expected === 0 || done < expected) continue;
+
+        this.logger.warn(
+          `Recovering stalled job — agents complete (${done}/${expected}) but never synthesized [job=${jobId}]`,
+        );
+        await this.synthesize(jobId);
+      } catch (err: unknown) {
+        this.logger.error(`Sweep failed for job=${jobId}`, err);
+      }
+    }
   }
 
   async synthesize(jobId: string): Promise<void> {
@@ -69,6 +146,25 @@ export class SynthesizerService implements OnModuleInit {
       return;
     }
 
+    // The claim lock expires after 300s so a crash mid-synthesis can't strand a
+    // job — which means it is a concurrency guard, NOT an idempotency guard.
+    // `ready_for_synthesis` can legitimately fire twice for one job: a message
+    // that burned its delivery-limit dead-letters, and the DLQ consumer's
+    // recordInfraFailure re-runs the same completion bookkeeping — SADD (no-op),
+    // SCARD (still complete), publish. Arriving more than 300s after the first
+    // synthesis, that lock is long gone and the job gets a second Sonnet call and
+    // a duplicate report row.
+    //
+    // A report already existing is the honest "this is done" signal, and it needs
+    // no new Redis key.
+    const existing = await this.prisma.report.findFirst({ where: { jobId } });
+    if (existing) {
+      this.logger.warn(
+        `Synthesis re-triggered for a job that already has a report — ignoring [job=${jobId}]`,
+      );
+      return;
+    }
+
     this.logger.log(`Synthesis started [job=${jobId}]`);
     const t = Date.now();
 
@@ -85,7 +181,8 @@ export class SynthesizerService implements OnModuleInit {
       });
       const latestByType = new Map<string, (typeof allRows)[number]>();
       for (const row of allRows) {
-        if (!latestByType.has(row.agentType)) latestByType.set(row.agentType, row);
+        if (!latestByType.has(row.agentType))
+          latestByType.set(row.agentType, row);
       }
       const results = [...latestByType.values()];
 
@@ -112,9 +209,16 @@ export class SynthesizerService implements OnModuleInit {
         results.map((r) => [r.agentType, r.rawOutput]),
       ) as AgentOutputsByType;
 
+      // The same AST ground truth the agents were given. The report quotes it
+      // directly — counts, real routes, the real module graph — so the numbers
+      // in the output are measured rather than recalled. Best-effort: an older
+      // job whose facts have aged out of Redis still renders, just without them.
+      const facts = await this.loadFacts(jobId);
+
       // 2. ONE Sonnet call for executive summary + recommendations only.
       //    Agents already did the extraction — Sonnet does cross-agent reasoning.
-      const synthesis = await this.callSonnet(byType);
+      const { synthesis, usage: synthesisUsage } =
+        await this.callSonnet(byType);
 
       // 3. Build every diagram from structured agent JSON and render each to
       //    SVG — still ZERO LLM calls; D2 layout and the charts are pure code.
@@ -122,15 +226,19 @@ export class SynthesizerService implements OnModuleInit {
       const diagrams = await this.diagrams.buildAll(
         byType,
         synthesis.overallHealthScore ?? 0,
+        facts,
       );
 
-      const totalTokens = results.reduce((sum, r) => {
-        const tokens = r.tokensUsed as {
-          input?: number;
-          output?: number;
-        } | null;
-        return sum + (tokens?.input ?? 0) + (tokens?.output ?? 0);
+      // Every token the job actually processed: each agent's row plus the
+      // synthesis call itself, which was previously never counted at all — the
+      // reported cost understated the real cost by one Sonnet call on every job.
+      // totalTokens() covers all four usage classes; see TokenUsage for why
+      // input + output alone stops being the truth once caching is on.
+      const agentTokens = results.reduce((sum, r) => {
+        const tokens = r.tokensUsed as TokenUsage | null;
+        return sum + (tokens ? totalTokens(tokens) : 0);
       }, 0);
+      const reportTotalTokens = agentTokens + totalTokens(synthesisUsage);
 
       // 4. Render the full Markdown report
       const markdown = this.renderer.render({
@@ -138,7 +246,8 @@ export class SynthesizerService implements OnModuleInit {
         agentOutputs: byType,
         diagrams,
         synthesis,
-        totalTokens,
+        totalTokens: reportTotalTokens,
+        facts,
       });
 
       // 5. Persist. Markdown carries the diagram *sources*; the rendered SVGs
@@ -151,7 +260,7 @@ export class SynthesizerService implements OnModuleInit {
           markdownContent: markdown,
           diagrams: diagrams as unknown as Prisma.InputJsonValue,
           synthesis: synthesis as unknown as Prisma.InputJsonValue,
-          totalTokens,
+          totalTokens: reportTotalTokens,
         },
       });
       await this.prisma.job.update({
@@ -195,9 +304,36 @@ export class SynthesizerService implements OnModuleInit {
     await this.redis.publish(jobEventsChannel(jobId), JSON.stringify(event));
   }
 
+  /**
+   * Read this job's AST ground truth.
+   *
+   * The synthesizer only knows the jobId — the facts are keyed by runKey
+   * (`{jobId}-{epoch}`), because they describe one specific checkout and a
+   * force-retry produces a different one. So resolve the epoch first; reading
+   * `job:{jobId}:repo_facts` would be reading a key that never existed.
+   */
+  private async loadFacts(jobId: string): Promise<RepoFacts | undefined> {
+    try {
+      const epoch = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
+      const raw = await this.redis.get(jobRepoFactsKey(runKeyOf(jobId, epoch)));
+      if (!raw) {
+        this.logger.warn(
+          `No repo_facts for job=${jobId} epoch=${epoch} — report will omit the measured sections`,
+        );
+        return undefined;
+      }
+      return JSON.parse(raw) as RepoFacts;
+    } catch (e: unknown) {
+      this.logger.warn(
+        `Failed to read repo_facts [job=${jobId}]: ${String(e)}`,
+      );
+      return undefined;
+    }
+  }
+
   private async callSonnet(
     byType: AgentOutputsByType,
-  ): Promise<SonnetSynthesisOutput> {
+  ): Promise<{ synthesis: SonnetSynthesisOutput; usage: TokenUsage }> {
     const response = await this.client.complete({
       anthropicModel: SONNET_MODEL,
       openaiModel: OPENAI_SYNTHESIS_MODEL,
@@ -232,14 +368,28 @@ export class SynthesizerService implements OnModuleInit {
     });
 
     try {
-      return JSON.parse(
+      const synthesis = JSON.parse(
         response.text.replace(/```json\n?|```/g, '').trim(),
       ) as SonnetSynthesisOutput;
-    } catch {
+      return { synthesis, usage: response.usage };
+    } catch (err: unknown) {
+      // This fallback ships a canned summary and a hardcoded health score of 50
+      // as if they were real findings. It used to do so silently — an empty
+      // `response.text` (the old content[0] bug) produced a plausible-looking
+      // report with no trace of the failure anywhere. If this fires, the report
+      // is fiction and someone needs to know.
+      this.logger.error(
+        `Synthesis JSON parse FAILED — report will ship a canned summary and a ` +
+          `placeholder health score of 50. Raw response (first 500 chars): ` +
+          `${JSON.stringify(response.text.slice(0, 500))} | ${String(err)}`,
+      );
       return {
-        executiveSummary: 'Analysis complete. See individual sections below.',
-        recommendations: [],
-        overallHealthScore: 50,
+        synthesis: {
+          executiveSummary: 'Analysis complete. See individual sections below.',
+          recommendations: [],
+          overallHealthScore: 50,
+        },
+        usage: response.usage,
       };
     }
   }

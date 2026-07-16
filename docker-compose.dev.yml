@@ -133,6 +133,18 @@ services:
     environment:
       <<: *common-env
       APP_NAME: synthesizer
+      # The synthesizer is the only service that renders D2 through WASM, and it
+      # was climbing to ~2.5GB per job and getting SIGKILLed by the VM's OOM
+      # killer (Docker's VM is ~3.8GB total, shared with two other Node services
+      # each running their own tsc watch). The kill is silent and unrecoverable:
+      # `nest start --watch` does not restart a killed child, so the container
+      # stays "Up" with a dead app, `restart: unless-stopped` never fires, and
+      # every later job hangs at "synthesizing" forever.
+      #
+      # Capping the old-space forces V8 to collect rather than grow into that
+      # kill. If a job genuinely needs more, it now surfaces as a catchable JS
+      # heap error naming the synthesizer instead of an invisible SIGKILL.
+      NODE_OPTIONS: '--max-old-space-size=1024'
     restart: unless-stopped
     depends_on: *infra-healthy
 

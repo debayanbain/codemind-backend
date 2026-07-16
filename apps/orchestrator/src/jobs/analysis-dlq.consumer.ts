@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as amqplib from 'amqplib';
-import { ANALYSIS_DLQ, DELIVERY_LIMIT } from '@app/common';
+import { ANALYSIS_DLQ, DELIVERY_LIMIT, withHeartbeat } from '@app/common';
 import { AnalysisRequestedMessage } from './orchestrator.consumer';
 import { JobFailureRecorderService } from './job-failure-recorder.service';
 
@@ -35,7 +35,9 @@ export class AnalysisDlqConsumer implements OnModuleInit, OnModuleDestroy {
       'RABBITMQ_URL',
       'amqp://codemind:codemind@localhost:5672',
     );
-    this.connection = await amqplib.connect(url);
+    // withHeartbeat: this bypasses the Nest transport factory and would
+    // otherwise keep the server's 60s default.
+    this.connection = await amqplib.connect(withHeartbeat(url));
     this.channel = await this.connection.createChannel();
     await this.channel.prefetch(1);
 
@@ -62,7 +64,9 @@ export class AnalysisDlqConsumer implements OnModuleInit, OnModuleDestroy {
         `Orchestrator crashed/failed ${DELIVERY_LIMIT}x processing this job — exhausted delivery-limit`,
       );
     } catch (err: unknown) {
-      this.logger.error(`Failed to process analysis DLQ message: ${String(err)}`);
+      this.logger.error(
+        `Failed to process analysis DLQ message: ${String(err)}`,
+      );
     } finally {
       this.channel?.ack(msg);
     }

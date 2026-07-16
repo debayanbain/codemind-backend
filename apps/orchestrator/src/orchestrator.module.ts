@@ -15,6 +15,7 @@ import { AnalysisDlqConsumer } from './jobs/analysis-dlq.consumer';
 import { JobFailureRecorderService } from './jobs/job-failure-recorder.service';
 import { GithubTarballService } from './github/github-tarball.service';
 import { RepoManifestService } from './manifest/repo-manifest.service';
+import { RepoFactsService } from './facts/repo-facts.service';
 import {
   AgentDispatchService,
   AGENT_TOPIC_CLIENT,
@@ -42,6 +43,7 @@ import {
     TokenEncryptionService,
     GithubTarballService,
     RepoManifestService,
+    RepoFactsService,
     AgentDispatchService,
     JobFailureRecorderService,
     AnalysisDlqConsumer,

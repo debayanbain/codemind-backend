@@ -1,8 +1,17 @@
 /**
- * Shapes of each agent's JSON output, matching the schema documented in that
- * agent's systemPrompt (apps/agent-worker/src/agents/*.agent.ts). All fields
- * optional — the LLM's output is only ever validated by JSON.parse, never
- * schema-checked, so any field can legitimately be missing.
+ * Shapes of each agent's JSON output.
+ *
+ * These are the **reader's** view, and every field is optional on purpose: a
+ * consumer must still guard, because an agent can fail and the synthesizer
+ * proceeds with whoever succeeded. That is not the same as the old contract,
+ * where nothing was checked at all and `{raw: "..."}` reached the renderer
+ * wearing this type.
+ *
+ * The **writer's** contract now lives in `../schema/agent-output.schemas.ts`,
+ * which is the single source for both the `emit_*` tool's JSON Schema and the
+ * runtime validator that gates what reaches Postgres. Required-vs-optional is
+ * decided there; when it says a field is required, output missing it is a
+ * failed agent, not a partial success.
  */
 
 export interface ModuleDependency {
