@@ -9,13 +9,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { Request } from 'express';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { JobRateLimitGuard } from './job-rate-limit.guard';
 import { JobsService } from './jobs.service';
 import { ShareService } from './share.service';
 
 @Controller('jobs')
-@UseGuards(JwtAuthGuard)
+@UseGuards(ClerkAuthGuard)
 export class JobsController {
   constructor(
     private readonly jobsService: JobsService,

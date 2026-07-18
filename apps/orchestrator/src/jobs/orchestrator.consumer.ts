@@ -92,7 +92,9 @@ export class OrchestratorConsumer {
     // rather than let it race the live run over the same checkout. Ack, don't
     // nack — the message isn't failed, it's obsolete; nacking would DLQ it and
     // mark a job that is currently running as failed.
-    const currentEpoch = Number((await this.redis.get(jobEpochKey(jobId))) ?? 0);
+    const currentEpoch = Number(
+      (await this.redis.get(jobEpochKey(jobId))) ?? 0,
+    );
     if (msg.epoch !== undefined && msg.epoch !== currentEpoch) {
       this.logger.warn(
         `Dropping superseded analysis.requested [job=${jobId}] — message epoch ${msg.epoch}, current ${currentEpoch}`,
@@ -113,6 +115,15 @@ export class OrchestratorConsumer {
       const user = await this.prisma.user.findUniqueOrThrow({
         where: { id: userId },
       });
+      // The token is nullable now (a user can sign in with Google and never link
+      // GitHub). The analyze endpoint gates on it, so this should be unreachable
+      // — but fail the job with a clear reason rather than crashing on decrypt if
+      // a token somehow went missing between enqueue and here.
+      if (!user.githubAccessTokenEncrypted) {
+        throw new Error(
+          'GitHub is not connected for this user — cannot download the repository. Reconnect GitHub and retry.',
+        );
+      }
       const accessToken = this.tokenEncryption.decrypt(
         user.githubAccessTokenEncrypted,
       );

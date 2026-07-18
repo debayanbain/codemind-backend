@@ -8,6 +8,9 @@ import { ApiGatewayModule } from './api-gateway.module';
 async function bootstrap() {
   const app = await NestFactory.create(ApiGatewayModule, {
     logger: createWinstonLogger('api-gateway'),
+    // Keep the raw request body around — the Clerk webhook's Svix signature is
+    // over the exact bytes, so it can't be verified from the parsed JSON.
+    rawBody: true,
   });
   const config = app.get(ConfigService);
 

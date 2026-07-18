@@ -1,10 +1,10 @@
 import { Controller, Get, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { ReposService } from './repos.service';
 
 @Controller('repos')
-@UseGuards(JwtAuthGuard)
+@UseGuards(ClerkAuthGuard)
 export class ReposController {
   constructor(private readonly reposService: ReposService) {}
 

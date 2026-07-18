@@ -1,5 +1,5 @@
 import { Controller, Get, Param, UseGuards } from '@nestjs/common';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { ShareService } from './share.service';
 
 /**
@@ -8,7 +8,7 @@ import { ShareService } from './share.service';
  * login with `?next=/share/<token>` and lands back here read-only.
  */
 @Controller('share')
-@UseGuards(JwtAuthGuard)
+@UseGuards(ClerkAuthGuard)
 export class ShareController {
   constructor(private readonly shareService: ShareService) {}
 

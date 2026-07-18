@@ -32,6 +32,8 @@ import { ReportRenderer } from '../report/report-renderer.service';
 const SONNET_MODEL =
   process.env.ANTHROPIC_SYNTHESIS_MODEL ?? 'claude-sonnet-4-6';
 const OPENAI_SYNTHESIS_MODEL = process.env.OPENAI_SYNTHESIS_MODEL ?? 'gpt-4o';
+const MISTRAL_SYNTHESIS_MODEL =
+  process.env.MISTRAL_SYNTHESIS_MODEL ?? 'mistral-large-latest';
 
 /**
  * How often to look for jobs whose wakeup was dropped. Long enough to be
@@ -337,6 +339,7 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
     const response = await this.client.complete({
       anthropicModel: SONNET_MODEL,
       openaiModel: OPENAI_SYNTHESIS_MODEL,
+      mistralModel: MISTRAL_SYNTHESIS_MODEL,
       maxTokens: 1400,
       system: `You are a principal engineer writing the executive assessment at the top of a codebase intelligence report that a developer will actually read. Respond ONLY with valid JSON. No preamble, no markdown fences.
         Schema:

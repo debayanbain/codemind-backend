@@ -2,12 +2,26 @@ import { Injectable, Logger } from '@nestjs/common';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { TokenUsage } from '../types/token-usage.types';
+import {
+  AgentProvider,
+  CompletionProvider,
+  resolveAgentProvider,
+  resolveSynthesisProvider,
+} from './pricing';
+
+/**
+ * Mistral speaks the OpenAI chat-completions dialect, so we drive it with the
+ * `openai` SDK pointed at Mistral's base URL rather than pulling in a second
+ * vendor SDK. One client library, two hosts.
+ */
+const MISTRAL_BASE_URL = 'https://api.mistral.ai/v1';
 
 export interface LlmCompleteParams {
   system: string;
   user: string;
   anthropicModel: string;
   openaiModel: string;
+  mistralModel: string;
   maxTokens: number;
 }
 
@@ -65,34 +79,80 @@ export interface LlmConverseResult {
   usage: TokenUsage;
 }
 
-// Provider toggle for local testing without an Anthropic key — the fixed
-// architecture (CLAUDE.md) is Anthropic Haiku/Sonnet; this is an escape
-// hatch, not a replacement. Default stays anthropic.
+/**
+ * Two independent provider decisions live here, and the split is the point.
+ *
+ * - `complete()` (single-shot, synthesizer only) runs on `LLM_PROVIDER` —
+ *   Anthropic by default, with an OpenAI escape hatch for local testing.
+ * - `converse()` (the agent tool-loop) runs on `AGENT_LLM_PROVIDER` — Mistral
+ *   for this build, per the approved deviation. The single Sonnet synthesis
+ *   call stays on the Anthropic key; the five parallel extraction agents move
+ *   to Mistral.
+ *
+ * They are separate because the two calls genuinely run on different providers
+ * at the same time; a single global toggle can't express that.
+ */
 @Injectable()
 export class LlmClient {
   private readonly logger = new Logger(LlmClient.name);
-  private readonly provider: 'anthropic' | 'openai';
+  private readonly synthesisProvider: CompletionProvider;
+  private readonly agentProvider: AgentProvider;
   private readonly anthropicClient?: Anthropic;
   private readonly openaiClient?: OpenAI;
+  private readonly mistralClient?: OpenAI;
 
   constructor() {
-    this.provider =
-      process.env.LLM_PROVIDER?.toLowerCase() === 'openai'
-        ? 'openai'
-        : 'anthropic';
+    this.synthesisProvider = resolveSynthesisProvider();
+    this.agentProvider = resolveAgentProvider();
 
-    if (this.provider === 'openai') {
+    // Build only the clients the two active providers actually need. With both
+    // on Mistral, Anthropic is never constructed — so a commented-out
+    // ANTHROPIC_API_KEY is fine and makes no calls.
+    if (this.synthesisProvider === 'openai') {
       this.openaiClient = new OpenAI();
-    } else {
+    }
+    if (
+      this.synthesisProvider === 'anthropic' ||
+      this.agentProvider === 'anthropic'
+    ) {
       this.anthropicClient = new Anthropic();
     }
-    this.logger.log(`LLM provider: ${this.provider}`);
+    if (
+      this.synthesisProvider === 'mistral' ||
+      this.agentProvider === 'mistral'
+    ) {
+      const apiKey = process.env.MISTRAL_API_KEY;
+      if (!apiKey) {
+        throw new Error(
+          'A provider resolves to Mistral but MISTRAL_API_KEY is not set. ' +
+            'Set MISTRAL_API_KEY, or force AGENT_LLM_PROVIDER / SYNTHESIS_LLM_PROVIDER to anthropic.',
+        );
+      }
+      this.mistralClient = new OpenAI({ apiKey, baseURL: MISTRAL_BASE_URL });
+    }
+    this.logger.log(
+      `LLM providers — complete()/synthesis: ${this.synthesisProvider}, converse()/agents: ${this.agentProvider}`,
+    );
   }
 
   async complete(params: LlmCompleteParams): Promise<LlmCompleteResult> {
-    if (this.provider === 'openai') {
-      const response = await this.openaiClient!.chat.completions.create({
-        model: params.openaiModel,
+    // Mistral and OpenAI share the chat-completions shape; only the client and
+    // model id differ. Anthropic stays as its own branch — dormant while the
+    // build is full-Mistral, one env flip away from active again.
+    if (
+      this.synthesisProvider === 'mistral' ||
+      this.synthesisProvider === 'openai'
+    ) {
+      const client =
+        this.synthesisProvider === 'mistral'
+          ? this.mistralClient!
+          : this.openaiClient!;
+      const model =
+        this.synthesisProvider === 'mistral'
+          ? params.mistralModel
+          : params.openaiModel;
+      const response = await client.chat.completions.create({
+        model,
         max_tokens: params.maxTokens,
         messages: [
           { role: 'system', content: params.system },
@@ -123,23 +183,23 @@ export class LlmClient {
   }
 
   /**
-   * One turn of a tool-use conversation. Anthropic only.
+   * One turn of a tool-use conversation.
    *
    * `complete()` takes `{system, user}` and hands back `{text, usage}` — a shape
    * that cannot express tools, `tool_use` blocks, `tool_result` blocks, or
-   * `stop_reason`. The agent loop is keyed on `stop_reason === 'tool_use'`, so it
-   * needs the real message surface, not a flattened string.
+   * `stop_reason`. The agent loop needs the real message surface, so this method
+   * speaks Anthropic's content-block shape end to end: `messages` and `tools`
+   * come in Anthropic-shaped, and `content`/`stopReason` go out Anthropic-shaped.
    *
-   * The OpenAI escape hatch stays on `complete()` and stops here: the loop is
-   * Anthropic-shaped, and CLAUDE.md fixes the LLM as the Anthropic API. Failing
-   * loudly at the call site beats silently degrading an agent to one shot.
+   * When the agent provider is Mistral, that Anthropic shape is a *stable
+   * intermediate representation*: `converseMistral` translates it to Mistral's
+   * OpenAI-dialect request and translates the reply back, so the entire loop in
+   * `base.agent.ts` — cache markers, `tool_result` blocks, forced `tool_choice`
+   * — stays provider-agnostic and unchanged.
    */
   async converse(params: LlmConverseParams): Promise<LlmConverseResult> {
-    if (this.provider !== 'anthropic') {
-      throw new Error(
-        `The agent tool loop requires LLM_PROVIDER=anthropic (currently "${this.provider}"). ` +
-          `The OpenAI escape hatch only supports single-shot completion.`,
-      );
+    if (this.agentProvider === 'mistral') {
+      return this.converseMistral(params);
     }
 
     // Sonnet 4.6 accepts adaptive thinking and `output_config.effort`, but
@@ -179,6 +239,77 @@ export class LlmClient {
       usage: readUsage(response.usage),
     };
   }
+
+  /**
+   * The Mistral implementation of `converse`.
+   *
+   * Mistral has no adaptive thinking, no `effort`, and no prompt-cache markers —
+   * so `params.thinking`, `params.effort`, and the `cache_control` blocks the
+   * loop stamps on messages are simply dropped in translation. They cost nothing
+   * to ignore: caching is a price optimisation, thinking is a depth knob, and
+   * neither changes the loop's contract.
+   *
+   * `strict` on the emit tool is Anthropic-only and is *not* forwarded — Mistral
+   * doesn't enforce it the same way, and the loop already re-validates the
+   * emitted payload and grants one repair turn, so a missing field degrades to a
+   * cheap correction rather than a hard failure.
+   */
+  private async converseMistral(
+    params: LlmConverseParams,
+  ): Promise<LlmConverseResult> {
+    const body: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming =
+      {
+        model: params.model,
+        max_tokens: params.maxTokens,
+        messages: toMistralMessages(params.system, params.messages),
+        tools: params.tools.map(toMistralTool),
+        ...(params.toolChoice
+          ? { tool_choice: toMistralToolChoice(params.toolChoice) }
+          : {}),
+        // The loop sets disable_parallel_tool_use only on the forced final
+        // emit; mirror it so Mistral can't answer that turn with two tool calls.
+        ...(params.toolChoice &&
+        'disable_parallel_tool_use' in params.toolChoice
+          ? { parallel_tool_calls: false }
+          : {}),
+      };
+
+    const response = await this.mistralClient!.chat.completions.create(body);
+    const choice = response.choices[0];
+    const message = choice?.message;
+
+    // Rebuild Anthropic-shaped content blocks: a text block if the model spoke,
+    // then one tool_use block per tool call. base.agent keys on block.type, not
+    // stop_reason, so this is the surface that actually matters.
+    const content: Anthropic.ContentBlock[] = [];
+    if (message?.content && typeof message.content === 'string') {
+      content.push({
+        type: 'text',
+        text: message.content,
+        citations: null,
+      } as unknown as Anthropic.ContentBlock);
+    }
+    for (const call of message?.tool_calls ?? []) {
+      if (call.type !== 'function') continue;
+      content.push({
+        type: 'tool_use',
+        id: call.id,
+        name: call.function.name,
+        input: parseToolArgs(call.function.arguments),
+      } as unknown as Anthropic.ContentBlock);
+    }
+
+    return {
+      stopReason: mapMistralFinishReason(choice?.finish_reason),
+      content,
+      usage: {
+        input: response.usage?.prompt_tokens ?? 0,
+        output: response.usage?.completion_tokens ?? 0,
+        cacheCreation: 0,
+        cacheRead: 0,
+      },
+    };
+  }
 }
 
 /**
@@ -209,4 +340,164 @@ function readUsage(usage: Anthropic.Usage): TokenUsage {
     cacheCreation: usage.cache_creation_input_tokens ?? 0,
     cacheRead: usage.cache_read_input_tokens ?? 0,
   };
+}
+
+// ── Anthropic ⇄ Mistral (OpenAI dialect) translation ────────────────────────
+//
+// The agent loop's conversation state is Anthropic content blocks. These
+// functions map that state onto Mistral's OpenAI-shaped request and map the
+// reply back. The mapping is total for the shapes this loop actually produces:
+// user messages are either a plain string or a list of tool_result blocks;
+// assistant messages are text and/or tool_use blocks.
+
+type MistralMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
+
+/**
+ * Flatten `{system, Anthropic messages}` into an OpenAI message array.
+ *
+ * The one ordering rule that matters: an assistant message carrying tool_calls
+ * must be followed by a `tool` message per call id before the next assistant
+ * turn. The loop always answers a batch of tool_use blocks with a single user
+ * message of matching tool_result blocks, so expanding each tool_result to its
+ * own `tool` message — in order, right after the assistant — preserves that.
+ */
+function toMistralMessages(
+  system: string,
+  messages: Anthropic.MessageParam[],
+): MistralMessage[] {
+  const out: MistralMessage[] = [{ role: 'system', content: system }];
+
+  for (const m of messages) {
+    if (m.role === 'user') {
+      if (typeof m.content === 'string') {
+        out.push({ role: 'user', content: m.content });
+        continue;
+      }
+      // tool_result blocks become `tool` messages; any stray text becomes a
+      // trailing user message. In this loop a user block-array is all
+      // tool_result, so the text branch is a defensive fallback.
+      const textParts: string[] = [];
+      for (const block of m.content) {
+        if (block.type === 'tool_result') {
+          out.push({
+            role: 'tool',
+            tool_call_id: block.tool_use_id,
+            content: toolResultText(block),
+          });
+        } else if (block.type === 'text') {
+          textParts.push(block.text);
+        }
+      }
+      if (textParts.length) {
+        out.push({ role: 'user', content: textParts.join('\n') });
+      }
+      continue;
+    }
+
+    // assistant
+    const blocks: Anthropic.ContentBlockParam[] =
+      typeof m.content === 'string'
+        ? [{ type: 'text', text: m.content }]
+        : m.content;
+    const textParts: string[] = [];
+    const toolCalls: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[] =
+      [];
+    for (const block of blocks) {
+      if (block.type === 'text') {
+        textParts.push(block.text);
+      } else if (block.type === 'tool_use') {
+        toolCalls.push({
+          id: block.id,
+          type: 'function',
+          function: {
+            name: block.name,
+            arguments: JSON.stringify(block.input ?? {}),
+          },
+        });
+      }
+      // thinking / redacted_thinking / cache_control-only blocks: nothing to
+      // carry across — Mistral has no equivalent.
+    }
+    const assistant: MistralMessage = {
+      role: 'assistant',
+      content: textParts.join('\n'),
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    };
+    out.push(assistant);
+  }
+
+  return out;
+}
+
+/**
+ * A tool_result's content is a string or an array of text blocks in this loop.
+ * `is_error` has no Mistral field, so mark it inline — the model reads it the
+ * same way it reads an errored Anthropic tool_result.
+ */
+function toolResultText(block: Anthropic.ToolResultBlockParam): string {
+  const raw =
+    typeof block.content === 'string'
+      ? block.content
+      : (block.content ?? [])
+          .map((c) => (c.type === 'text' ? c.text : ''))
+          .join('\n');
+  return block.is_error ? `ERROR: ${raw}` : raw;
+}
+
+/** Anthropic tool → OpenAI/Mistral function tool. `strict` is intentionally dropped. */
+function toMistralTool(
+  tool: Anthropic.ToolUnion,
+): OpenAI.Chat.Completions.ChatCompletionTool {
+  const t = tool as Anthropic.Tool;
+  return {
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    },
+  };
+}
+
+/**
+ * The loop only ever forces one specific tool (the emit tool on the final
+ * turn). Map that to Mistral's specific-function form; anything else falls back
+ * to `auto`.
+ */
+function toMistralToolChoice(
+  choice: Anthropic.ToolChoice,
+): OpenAI.Chat.Completions.ChatCompletionToolChoiceOption {
+  if (choice.type === 'tool') {
+    return { type: 'function', function: { name: choice.name } };
+  }
+  if (choice.type === 'any') return 'required';
+  return 'auto';
+}
+
+/** Parse a tool call's JSON arguments; a malformed payload becomes `{}` so the
+ * loop's emit-validation + repair turn can recover rather than the run throwing. */
+function parseToolArgs(args: string | undefined): Record<string, unknown> {
+  if (!args) return {};
+  try {
+    return JSON.parse(args) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/** base.agent keys on tool_use blocks, not stop_reason, so this is cosmetic —
+ * kept faithful anyway. */
+function mapMistralFinishReason(
+  reason: string | null | undefined,
+): Anthropic.Message['stop_reason'] {
+  switch (reason) {
+    case 'tool_calls':
+      return 'tool_use';
+    case 'length':
+      return 'max_tokens';
+    case 'stop':
+      return 'end_turn';
+    default:
+      return 'end_turn';
+  }
 }

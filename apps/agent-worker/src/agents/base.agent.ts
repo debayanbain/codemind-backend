@@ -8,6 +8,7 @@ import {
   noTokens,
   addTokens,
   totalTokens,
+  agentModel,
   AGENT_OUTPUT_SCHEMAS,
   AgentSchemaKey,
 } from '@app/common';
@@ -55,7 +56,9 @@ export interface AgentResult {
   durationMs: number;
 }
 
-const AGENT_MODEL = process.env.ANTHROPIC_AGENT_MODEL ?? 'claude-sonnet-4-6';
+// The model string sent to the provider. `agentModel()` follows AGENT_LLM_PROVIDER
+// (Mistral for this build, Anthropic otherwise) so the model we call is the same
+// one the report prices and displays — no drift between what ran and what's billed.
 const AGENT_EFFORT = (process.env.ANTHROPIC_AGENT_EFFORT ?? 'medium') as
   'low' | 'medium' | 'high' | 'max';
 /** Seed-message ceiling. The loop grows past this by design; this bounds turn 1. */
@@ -206,7 +209,7 @@ export abstract class BaseAgent {
         }
 
         const res = await this.client.converse({
-          model: AGENT_MODEL,
+          model: agentModel(),
           system: this.systemPrompt,
           messages: withRollingCache(messages),
           tools,

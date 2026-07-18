@@ -37,12 +37,26 @@ enum AgentRunStatus {
 }
 
 model User {
-  id                         String   @id @default(uuid())
-  githubId                   String   @unique @map("github_id")
-  githubAccessTokenEncrypted String   @map("github_access_token_encrypted")
+  id String @id @default(uuid())
+  // Clerk is the identity provider now. clerkId is the stable primary key we
+  // key everything to; GitHub is an *optional* linked account (a user can sign
+  // in with Google and connect GitHub later), so the github_* columns are
+  // nullable and populated only once the GitHub OAuth token is fetched.
+  clerkId                    String   @unique @map("clerk_id")
+  email                      String?  @map("email")
+  // Display name from Clerk (first + last, or Google profile name). Nullable:
+  // a GitHub-only user may have none, and we fall back to username/email.
+  name                       String?  @map("name")
+  githubId                   String?  @unique @map("github_id")
+  githubAccessTokenEncrypted String?  @map("github_access_token_encrypted")
   githubUsername             String?  @map("github_username")
   avatarUrl                  String?  @map("avatar_url")
   createdAt                  DateTime @default(now()) @map("created_at")
+  // Bumped on every sync (webhook or lazy refresh). getOrCreateUser uses it to
+  // re-pull a profile from Clerk at most once per TTL — the backstop for a
+  // permanently-lost user.updated webhook. @default(now()) so the column can be
+  // added NOT NULL to the existing row.
+  updatedAt                  DateTime @default(now()) @updatedAt @map("updated_at")
 
   jobs   Job[]
   shares ReportShare[]
@@ -58,7 +72,7 @@ model Job {
   createdAt    DateTime  @default(now()) @map("created_at")
   completedAt  DateTime? @map("completed_at")
 
-  user         User          @relation(fields: [userId], references: [id])
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   agentResults AgentResult[]
   report       Report?
 
@@ -77,7 +91,7 @@ model AgentResult {
   error      String?
   createdAt  DateTime       @default(now()) @map("created_at")
 
-  job Job @relation(fields: [jobId], references: [id])
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
   @@index([jobId])
   @@map("agent_results")
@@ -101,7 +115,7 @@ model Report {
   totalTokens     Int      @default(0) @map("total_tokens")
   createdAt       DateTime @default(now()) @map("created_at")
 
-  job    Job           @relation(fields: [jobId], references: [id])
+  job    Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
   shares ReportShare[]
 
   @@map("reports")
@@ -123,7 +137,7 @@ model ReportShare {
   createdAt   DateTime  @default(now()) @map("created_at")
 
   report    Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
-  createdBy User   @relation(fields: [createdById], references: [id])
+  createdBy User   @relation(fields: [createdById], references: [id], onDelete: Cascade)
 
   @@index([reportId])
   @@map("report_shares")

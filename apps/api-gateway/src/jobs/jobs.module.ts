@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ClientsModule } from '@nestjs/microservices';
 import { buildAnalysisQueueOptions } from '@app/common';
 
+import { AuthModule } from '../auth/auth.module';
 import { AnalyzeController } from './analyze.controller';
 import { JobsController } from './jobs.controller';
 import { ExportController } from './export.controller';
@@ -14,6 +15,7 @@ import { JobRateLimitGuard } from './job-rate-limit.guard';
 @Module({
   imports: [
     ConfigModule,
+    AuthModule,
     ClientsModule.registerAsync([
       {
         name: ANALYSIS_QUEUE_CLIENT,

@@ -2,7 +2,6 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
-  NotFoundException,
 } from '@nestjs/common';
 import { PrismaService, JobStatus } from '@app/common';
 import { AuthService } from '../auth/auth.service';
@@ -106,10 +105,10 @@ export class ReposService {
   ) {}
 
   async listRepos(userId: string): Promise<GithubRepoSummary[]> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) throw new NotFoundException('User not found');
-
-    const token = this.authService.decryptAccessToken(user);
+    // Fetch a fresh GitHub token from Clerk (and persist it encrypted). Throws
+    // 409 github_not_connected for a user with no linked GitHub — the frontend
+    // shows the Connect GitHub card instead of an empty/failed list.
+    const token = await this.authService.ensureGithubToken(userId);
     const nodes = await this.fetchAllRepoNodes(token);
 
     const lastJobByRepo = await this.getLastJobsByRepo(
@@ -117,25 +116,30 @@ export class ReposService {
       nodes.map((n) => n.nameWithOwner),
     );
 
-    return nodes
-      // A repo without a numeric databaseId can't be reconciled with the rest
-      // of the system (jobs key off it), so skip it defensively.
-      .filter((n): n is GraphQlRepoNode & { databaseId: number } => n.databaseId != null)
-      .map((n) => {
-        const lastJob = lastJobByRepo.get(n.nameWithOwner);
-        return {
-          id: n.databaseId,
-          fullName: n.nameWithOwner,
-          private: n.isPrivate,
-          defaultBranch: n.defaultBranchRef?.name ?? 'main',
-          updatedAt: n.updatedAt,
-          language: n.primaryLanguage?.name ?? null,
-          languages: this.toLanguageStats(n.languages),
-          htmlUrl: n.url,
-          lastJobId: lastJob?.id ?? null,
-          lastJobStatus: lastJob?.status ?? null,
-        };
-      });
+    return (
+      nodes
+        // A repo without a numeric databaseId can't be reconciled with the rest
+        // of the system (jobs key off it), so skip it defensively.
+        .filter(
+          (n): n is GraphQlRepoNode & { databaseId: number } =>
+            n.databaseId != null,
+        )
+        .map((n) => {
+          const lastJob = lastJobByRepo.get(n.nameWithOwner);
+          return {
+            id: n.databaseId,
+            fullName: n.nameWithOwner,
+            private: n.isPrivate,
+            defaultBranch: n.defaultBranchRef?.name ?? 'main',
+            updatedAt: n.updatedAt,
+            language: n.primaryLanguage?.name ?? null,
+            languages: this.toLanguageStats(n.languages),
+            htmlUrl: n.url,
+            lastJobId: lastJob?.id ?? null,
+            lastJobStatus: lastJob?.status ?? null,
+          };
+        })
+    );
   }
 
   /** Page through the GraphQL repositories connection until exhausted. */

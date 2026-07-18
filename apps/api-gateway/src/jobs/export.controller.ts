@@ -12,7 +12,7 @@ import {
 import type { Request, Response } from 'express';
 import { mdToPdf } from 'md-to-pdf';
 import { inlineDiagrams, RenderedDiagram } from '@app/common';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { JobsService } from './jobs.service';
 
 type ExportFormat = 'md' | 'pdf';
@@ -52,7 +52,7 @@ const PDF_CSS = `
 `;
 
 @Controller('jobs/:jobId/export')
-@UseGuards(JwtAuthGuard)
+@UseGuards(ClerkAuthGuard)
 export class ExportController {
   private readonly logger = new Logger(ExportController.name);
 

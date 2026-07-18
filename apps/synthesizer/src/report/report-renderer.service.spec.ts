@@ -159,7 +159,12 @@ describe('ReportRenderer', () => {
     // "prices with the model that actually ran" that silently reads ambient
     // config is asserting on whatever the developer last configured. It broke
     // the moment the agents moved to Haiku, which is the tell.
-    const prev = process.env.ANTHROPIC_AGENT_MODEL;
+    // Pin the provider too: agentModel() now follows AGENT_LLM_PROVIDER (Mistral
+    // by default for this build), so pricing the Anthropic path means asserting
+    // it explicitly rather than inheriting whatever .env last selected.
+    const prevModel = process.env.ANTHROPIC_AGENT_MODEL;
+    const prevProvider = process.env.AGENT_LLM_PROVIDER;
+    process.env.AGENT_LLM_PROVIDER = 'anthropic';
     process.env.ANTHROPIC_AGENT_MODEL = 'claude-sonnet-4-6';
     try {
       const md = renderer.render(input());
@@ -171,14 +176,17 @@ describe('ReportRenderer', () => {
       // input+output combined, and so under-reported by ~6x.
       expect(md).toContain('~$0.576');
     } finally {
-      process.env.ANTHROPIC_AGENT_MODEL = prev;
+      process.env.ANTHROPIC_AGENT_MODEL = prevModel;
+      process.env.AGENT_LLM_PROVIDER = prevProvider;
     }
   });
 
   it('prices a Haiku run at Haiku rates', () => {
     // The other half of the same claim: the figure has to move when the model
-    // does. Agents run Haiku (CLAUDE.md Section 8).
-    const prev = process.env.ANTHROPIC_AGENT_MODEL;
+    // does. Haiku is the Anthropic-provider agent model (CLAUDE.md Section 8).
+    const prevModel = process.env.ANTHROPIC_AGENT_MODEL;
+    const prevProvider = process.env.AGENT_LLM_PROVIDER;
+    process.env.AGENT_LLM_PROVIDER = 'anthropic';
     process.env.ANTHROPIC_AGENT_MODEL = 'claude-haiku-4-5';
     try {
       const md = renderer.render(input());
@@ -187,7 +195,28 @@ describe('ReportRenderer', () => {
       // 120k × (1×0.85 + 5×0.15)/1e6 = $0.192 — ~3x cheaper than the Sonnet run.
       expect(md).toContain('~$0.192');
     } finally {
-      process.env.ANTHROPIC_AGENT_MODEL = prev;
+      process.env.ANTHROPIC_AGENT_MODEL = prevModel;
+      process.env.AGENT_LLM_PROVIDER = prevProvider;
+    }
+  });
+
+  it('prices a Mistral agent run at Mistral rates', () => {
+    // Agents run on Mistral for this build (synthesis stays Anthropic). The cost
+    // has to follow the model that actually ran the agents, not the Anthropic
+    // fallback config that is still present in the env.
+    const prevProvider = process.env.AGENT_LLM_PROVIDER;
+    const prevModel = process.env.MISTRAL_AGENT_MODEL;
+    process.env.AGENT_LLM_PROVIDER = 'mistral';
+    process.env.MISTRAL_AGENT_MODEL = 'mistral-large-latest';
+    try {
+      const md = renderer.render(input());
+
+      expect(md).toContain('mistral-large-latest');
+      // 120k × (2×0.85 + 6×0.15)/1e6 = $0.312.
+      expect(md).toContain('~$0.312');
+    } finally {
+      process.env.AGENT_LLM_PROVIDER = prevProvider;
+      process.env.MISTRAL_AGENT_MODEL = prevModel;
     }
   });
 
