@@ -71,6 +71,10 @@ model Job {
   status       JobStatus @default(pending)
   createdAt    DateTime  @default(now()) @map("created_at")
   completedAt  DateTime? @map("completed_at")
+  // Human-readable failure reason (tarball 404, size cap, index crash, …),
+  // persisted so a failed job stays diagnosable after reload — the live
+  // socket `job:failed` event is best-effort and lost on refresh.
+  error        String?   @map("error")
 
   user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   agentResults AgentResult[]

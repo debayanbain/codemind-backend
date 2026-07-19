@@ -9,6 +9,17 @@ import { GithubNotConnectedException } from './github-not-connected.exception';
 // per user per window instead of every request.
 const REFRESH_TTL_MS = 60 * 60 * 1000; // 1h
 
+/** Prisma error codes that mean "DB was momentarily unreachable" — safe to retry. */
+function isTransientDbError(e: unknown): boolean {
+  const code = (e as { code?: string })?.code;
+  return (
+    code === 'P1001' || // can't reach database server
+    code === 'P1002' || // server reached but timed out
+    code === 'P1008' || // operations timed out
+    code === 'P1017' //   server closed the connection
+  );
+}
+
 /** The subset of profile we persist, normalized from either Clerk shape. */
 interface NormalizedUser {
   clerkId: string;
@@ -43,16 +54,19 @@ export class AuthService {
    * row is served rather than failing the request.
    */
   async getOrCreateUser(clerkUserId: string): Promise<User> {
-    const existing = await this.prisma.user.findUnique({
-      where: { clerkId: clerkUserId },
-    });
+    const existing = await this.withDbRetry(() =>
+      this.prisma.user.findUnique({ where: { clerkId: clerkUserId } }),
+    );
     if (existing) {
-      const fresh =
-        Date.now() - existing.updatedAt.getTime() <= REFRESH_TTL_MS;
+      const fresh = Date.now() - existing.updatedAt.getTime() <= REFRESH_TTL_MS;
       if (fresh) return existing;
+      // Stale → best-effort refresh. A Clerk or DB error here must never fail a
+      // request for a user we already have: serve the cached row.
       try {
         const clerkUser = await this.clerk.getUser(clerkUserId);
-        return await this.upsertUser(fromClerkUser(clerkUser));
+        return await this.withDbRetry(() =>
+          this.upsertUser(fromClerkUser(clerkUser)),
+        );
       } catch (e: unknown) {
         this.logger.warn(
           `Profile refresh failed for clerkId=${clerkUserId}, serving cached row: ${String(e)}`,
@@ -60,23 +74,100 @@ export class AuthService {
         return existing;
       }
     }
-    const clerkUser = await this.clerk.getUser(clerkUserId);
-    return this.upsertUser(fromClerkUser(clerkUser));
+    // No row yet. The Bearer token already verified, so this is a real Clerk
+    // user — mint the row even if Clerk's profile fetch fails (a minimal row,
+    // backfilled later by the webhook or the TTL refresh) rather than 500 a
+    // legitimate first request during a Clerk API blip.
+    let normalized: NormalizedUser;
+    try {
+      normalized = fromClerkUser(await this.clerk.getUser(clerkUserId));
+    } catch (e: unknown) {
+      this.logger.warn(
+        `Clerk profile fetch failed for new clerkId=${clerkUserId}; creating minimal row: ${String(e)}`,
+      );
+      normalized = {
+        clerkId: clerkUserId,
+        email: null,
+        name: null,
+        githubId: null,
+        githubUsername: null,
+        avatarUrl: null,
+      };
+    }
+    return this.createUserSafely(normalized);
+  }
+
+  /**
+   * Upsert a brand-new user, surviving a concurrent create. Two of a new user's
+   * first requests can both miss the row and race to insert; upsert's ON
+   * CONFLICT covers the clerkId collision, but any residual unique clash (or a
+   * driver-level race) surfaces as P2002 — re-read and return the winner's row
+   * instead of failing.
+   */
+  private async createUserSafely(n: NormalizedUser): Promise<User> {
+    try {
+      return await this.withDbRetry(() => this.upsertUser(n));
+    } catch (e: unknown) {
+      if ((e as { code?: string }).code === 'P2002') {
+        const row = await this.withDbRetry(() =>
+          this.prisma.user.findUnique({ where: { clerkId: n.clerkId } }),
+        );
+        if (row) return row;
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Retry a DB op through a transient connectivity blip (Supabase pooler drop /
+   * timeout) instead of surfacing it as a 500. Only the known-transient Prisma
+   * codes retry; anything else (constraint violation, bad query) throws at once.
+   */
+  private async withDbRetry<T>(op: () => Promise<T>): Promise<T> {
+    const delaysMs = [150, 400];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await op();
+      } catch (e: unknown) {
+        if (attempt >= delaysMs.length || !isTransientDbError(e)) throw e;
+        this.logger.warn(
+          `Transient DB error (${(e as { code?: string }).code}), retry ${attempt + 1}/${delaysMs.length}`,
+        );
+        await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+      }
+    }
   }
 
   /** Clerk webhook (user.created / user.updated) → keep the row fresh. */
   syncFromWebhook(data: unknown): Promise<User> {
-    return this.upsertUser(fromWebhookData(data));
+    return this.withDbRetry(() => this.upsertUser(fromWebhookData(data)));
   }
 
   /** Clerk webhook (user.deleted). FK cascades drop jobs/results/reports/shares. */
   async deleteByClerkId(clerkUserId: string): Promise<void> {
-    await this.prisma.user.deleteMany({ where: { clerkId: clerkUserId } });
+    await this.withDbRetry(() =>
+      this.prisma.user.deleteMany({ where: { clerkId: clerkUserId } }),
+    );
     this.logger.log(`Deleted user for clerkId=${clerkUserId}`);
   }
 
-  isGithubConnected(clerkUserId: string): Promise<boolean> {
-    return this.clerk.hasGithub(clerkUserId);
+  /**
+   * Whether the user has a *verified* GitHub link. Never throws: a Clerk API
+   * blip degrades to `fallback` (the caller passes the DB-known state, e.g.
+   * whether a github_username is already stored) so /auth/me can't 500 here.
+   */
+  async isGithubConnected(
+    clerkUserId: string,
+    fallback = false,
+  ): Promise<boolean> {
+    try {
+      return await this.clerk.hasGithub(clerkUserId);
+    } catch (e: unknown) {
+      this.logger.warn(
+        `hasGithub failed for clerkId=${clerkUserId}, falling back to ${fallback}: ${String(e)}`,
+      );
+      return fallback;
+    }
   }
 
   /**
@@ -88,16 +179,53 @@ export class AuthService {
    * context and reads the stored token, so it must already be there and current.
    */
   async ensureGithubToken(userId: string): Promise<string> {
-    const user = await this.prisma.user.findUniqueOrThrow({
-      where: { id: userId },
-    });
+    const user = await this.withDbRetry(() =>
+      this.prisma.user.findUniqueOrThrow({ where: { id: userId } }),
+    );
     const token = await this.clerk.getGithubToken(user.clerkId);
     if (!token) throw new GithubNotConnectedException();
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { githubAccessTokenEncrypted: this.tokenEncryption.encrypt(token) },
-    });
+    // Persist the encrypted token AND backfill the GitHub identity. We read
+    // id/login straight from GitHub's /user with the token we already hold —
+    // Clerk's external-account `username`/`provider_user_id` come back empty for
+    // a custom-credentials GitHub connection, so it can't be the source. This
+    // runs on repo-list/analyze, right after Connect, so github_id/username land
+    // as soon as GitHub is linked. Sparse: never null a field GitHub didn't give.
+    const identity = await this.fetchGithubIdentity(token);
+    await this.withDbRetry(() =>
+      this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          githubAccessTokenEncrypted: this.tokenEncryption.encrypt(token),
+          ...(identity ? { githubId: identity.id } : {}),
+          ...(identity ? { githubUsername: identity.login } : {}),
+        },
+      }),
+    );
     return token;
+  }
+
+  /**
+   * The GitHub user's numeric id + login, read from `/user` with their OAuth
+   * token. Returns null on any failure — identity backfill is best-effort and
+   * must never block the token the caller actually needs.
+   */
+  private async fetchGithubIdentity(
+    token: string,
+  ): Promise<{ id: string; login: string } | null> {
+    try {
+      const res = await fetch('https://api.github.com/user', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'User-Agent': 'CodeMind',
+          Accept: 'application/vnd.github+json',
+        },
+      });
+      if (!res.ok) return null;
+      const u = (await res.json()) as { id?: number; login?: string };
+      return u.id && u.login ? { id: String(u.id), login: u.login } : null;
+    } catch {
+      return null;
+    }
   }
 
   private upsertUser(n: NormalizedUser): Promise<User> {

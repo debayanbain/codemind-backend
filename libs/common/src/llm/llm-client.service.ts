@@ -16,6 +16,12 @@ import {
  */
 const MISTRAL_BASE_URL = 'https://api.mistral.ai/v1';
 
+// The provider SDKs retry 429/5xx/connection errors with exponential backoff +
+// jitter, honouring Retry-After. The default (2) is too few for Mistral's
+// low-tier rate limit when five agents and the synthesis call contend for it —
+// lift it so later attempts back off far enough for the rate window to reset.
+const LLM_MAX_RETRIES = Number(process.env.LLM_MAX_RETRIES ?? 6);
+
 export interface LlmCompleteParams {
   system: string;
   user: string;
@@ -109,13 +115,13 @@ export class LlmClient {
     // on Mistral, Anthropic is never constructed — so a commented-out
     // ANTHROPIC_API_KEY is fine and makes no calls.
     if (this.synthesisProvider === 'openai') {
-      this.openaiClient = new OpenAI();
+      this.openaiClient = new OpenAI({ maxRetries: LLM_MAX_RETRIES });
     }
     if (
       this.synthesisProvider === 'anthropic' ||
       this.agentProvider === 'anthropic'
     ) {
-      this.anthropicClient = new Anthropic();
+      this.anthropicClient = new Anthropic({ maxRetries: LLM_MAX_RETRIES });
     }
     if (
       this.synthesisProvider === 'mistral' ||
@@ -128,7 +134,11 @@ export class LlmClient {
             'Set MISTRAL_API_KEY, or force AGENT_LLM_PROVIDER / SYNTHESIS_LLM_PROVIDER to anthropic.',
         );
       }
-      this.mistralClient = new OpenAI({ apiKey, baseURL: MISTRAL_BASE_URL });
+      this.mistralClient = new OpenAI({
+        apiKey,
+        baseURL: MISTRAL_BASE_URL,
+        maxRetries: LLM_MAX_RETRIES,
+      });
     }
     this.logger.log(
       `LLM providers — complete()/synthesis: ${this.synthesisProvider}, converse()/agents: ${this.agentProvider}`,

@@ -37,10 +37,13 @@ async function bootstrap() {
   await app.startAllMicroservices();
 
   new Logger('Bootstrap').log(
-    `listening on ${Object.keys(AGENT_ROUTING_KEYS).length} agent queues`,
+    'listening on ' + Object.keys(AGENT_ROUTING_KEYS).length + ' agent queues',
   );
 }
-bootstrap().catch((err) => {
-  new Logger('Bootstrap').error('failed to start', err?.stack);
+bootstrap().catch((err: unknown) => {
+  new Logger('Bootstrap').error(
+    'failed to start',
+    err instanceof Error ? err.stack : undefined,
+  );
   process.exit(1);
 });

@@ -32,7 +32,7 @@ export class GithubTarballService {
 
   async downloadAndExtract(
     repoFullName: string,
-    accessToken: string,
+    accessToken: string | null,
     jobId: string,
     runKey: string = jobId,
   ): Promise<{ repoPath: string }> {
@@ -50,7 +50,10 @@ export class GithubTarballService {
         `https://api.github.com/repos/${repoFullName}/tarball`,
         {
           headers: {
-            Authorization: `token ${accessToken}`,
+            // Public repos download unauthenticated — a Google-only user can
+            // paste a public URL with no linked GitHub. A token, when present,
+            // lifts the 60/hr anonymous rate limit and unlocks private repos.
+            ...(accessToken ? { Authorization: `token ${accessToken}` } : {}),
             'User-Agent': 'CodeMind',
             Accept: 'application/vnd.github+json',
           },

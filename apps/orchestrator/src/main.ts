@@ -52,7 +52,10 @@ async function bootstrap() {
     `listening on queue "${ANALYSIS_REQUESTED_QUEUE}"`,
   );
 }
-bootstrap().catch((err) => {
-  new Logger('Bootstrap').error('failed to start', err?.stack);
+bootstrap().catch((err: unknown) => {
+  new Logger('Bootstrap').error(
+    'failed to start',
+    err instanceof Error ? err.stack : undefined,
+  );
   process.exit(1);
 });

@@ -458,6 +458,10 @@ export abstract class BaseAgent {
       // `required` list that omits them (verified against haiku-4-5 and
       // sonnet-4-6, both of which report `structured_outputs: true` on the Models
       // API — the older claim that Sonnet 4.6 lacks them was wrong).
+      //
+      // `strict` lives on newer @anthropic-ai/sdk Tool types; assert so this
+      // compiles against an older pinned SDK too. Kept in the payload for the
+      // Anthropic path; ignored on the Mistral path the agents currently use.
       strict: true,
     } as Anthropic.Tool;
   }

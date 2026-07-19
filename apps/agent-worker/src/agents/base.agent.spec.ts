@@ -232,8 +232,12 @@ describe('BaseAgent evidence loop', () => {
     // no repair left and the agent fails for real.
     const converse = jest
       .fn()
-      .mockResolvedValueOnce(turn([toolUse('emit_docs', { doc_score: 'high' })]))
-      .mockResolvedValueOnce(turn([toolUse('emit_docs', { doc_score: 'high' })]));
+      .mockResolvedValueOnce(
+        turn([toolUse('emit_docs', { doc_score: 'high' })]),
+      )
+      .mockResolvedValueOnce(
+        turn([toolUse('emit_docs', { doc_score: 'high' })]),
+      );
 
     const res = await withClient(new TestAgent(), converse).run(baseCtx());
 
@@ -250,7 +254,9 @@ describe('BaseAgent evidence loop', () => {
     // failure; one more turn is the cheap one.
     const converse = jest
       .fn()
-      .mockResolvedValueOnce(turn([toolUse('emit_docs', { doc_score: 'high' })]))
+      .mockResolvedValueOnce(
+        turn([toolUse('emit_docs', { doc_score: 'high' })]),
+      )
       .mockResolvedValueOnce(turn([toolUse('emit_docs', VALID_DOCS_OUTPUT)]));
 
     const res = await withClient(new TestAgent(), converse).run(baseCtx());
@@ -262,9 +268,8 @@ describe('BaseAgent evidence loop', () => {
     // The correction must come back as an errored tool_result: it is the only
     // block allowed to follow a tool_use, and `is_error` is what tells the model
     // to try again rather than treat the rejection as data.
-    const repairMessages = (
-      converse.mock.calls[1][0] as LlmConverseParams
-    ).messages;
+    const repairMessages = (converse.mock.calls[1][0] as LlmConverseParams)
+      .messages;
     const last = repairMessages[repairMessages.length - 1];
     const block = (last.content as Anthropic.ToolResultBlockParam[])[0];
     expect(last.role).toBe('user');

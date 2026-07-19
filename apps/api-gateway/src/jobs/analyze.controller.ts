@@ -9,6 +9,7 @@ import {
 import type { Request } from 'express';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { AuthService } from '../auth/auth.service';
+import { GithubNotConnectedException } from '../auth/github-not-connected.exception';
 import { JobRateLimitGuard } from './job-rate-limit.guard';
 import { JobsService } from './jobs.service';
 
@@ -32,12 +33,16 @@ export class AnalyzeController {
     }
 
     const userId = (req.user as { id: string }).id;
-    // Pull a fresh GitHub token from Clerk and persist it before enqueueing, so
-    // the orchestrator (separate process, no request context) can read it from
-    // the DB to download the tarball. Throws 409 github_not_connected for a
-    // user who hasn't linked GitHub — the frontend turns that into the Connect
-    // GitHub prompt instead of a failed analysis.
-    await this.authService.ensureGithubToken(userId);
+    // Best-effort token: if the user has linked GitHub, pull + persist a fresh
+    // token so the orchestrator can download private repos (and dodge the anon
+    // rate limit). A user with no GitHub can still analyze a PUBLIC repo pasted
+    // by URL — the orchestrator downloads it unauthenticated — so a missing link
+    // is not an error here, only for private repos (which then 404 downstream).
+    try {
+      await this.authService.ensureGithubToken(userId);
+    } catch (e: unknown) {
+      if (!(e instanceof GithubNotConnectedException)) throw e;
+    }
 
     const job = await this.jobsService.createAnalysisJob(userId, repoFullName);
     return { jobId: job.id, status: job.status };

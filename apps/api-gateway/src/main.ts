@@ -23,9 +23,15 @@ async function bootstrap() {
   const port = config.get<number>('API_GATEWAY_PORT', 3000);
   await app.listen(port);
 
-  new Logger('Bootstrap').log(`listening on :${port}`);
+  new Logger('Bootstrap').log(
+    `🎊 Nest application of APIGATEWAY is successfully started. On port: http://localhost:${port}/health 🎉`,
+  );
 }
-bootstrap().catch((err) => {
-  new Logger('Bootstrap').error('failed to start', err?.stack);
+
+bootstrap().catch((err: unknown) => {
+  new Logger('Bootstrap').error(
+    'failed to start',
+    err instanceof Error ? err.stack : undefined,
+  );
   process.exit(1);
 });

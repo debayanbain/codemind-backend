@@ -12,7 +12,7 @@
     "build:agent-worker": "nest build agent-worker",
     "build:synthesizer": "nest build synthesizer",
     "format": "prettier --write \"apps/**/*.ts\" \"libs/**/*.ts\" \"test/**/*.ts\"",
-    "start:dev": "nest start api-gateway",
+    "start:dev": "nest start api-gateway --watch",
     "start:api-gateway:dev": "nest start api-gateway --watch",
     "start:orchestrator": "nest start orchestrator",
     "start:orchestrator:dev": "nest start orchestrator --watch",

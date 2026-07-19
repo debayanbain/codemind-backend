@@ -24,7 +24,9 @@ export class JobFailureRecorderService {
   async markFailed(jobId: string, reason: string): Promise<void> {
     await this.prisma.job.update({
       where: { id: jobId },
-      data: { status: 'failed', completedAt: new Date() },
+      // Persist a capped reason so the failure stays diagnosable after reload,
+      // not just in the best-effort socket event.
+      data: { status: 'failed', completedAt: new Date(), error: reason.slice(0, 500) },
     });
     await this.redis.set(jobStatusKey(jobId), 'failed');
 

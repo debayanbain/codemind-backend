@@ -17,10 +17,7 @@ import {
   jobRepoFactsKey,
 } from '@app/common';
 
-import {
-  GithubTarballService,
-  TarballDownloadError,
-} from '../github/github-tarball.service';
+import { GithubTarballService } from '../github/github-tarball.service';
 import { RepoManifestService } from '../manifest/repo-manifest.service';
 import { AgentDispatchService } from '../dispatch/agent-dispatch.service';
 import { JobFailureRecorderService } from './job-failure-recorder.service';
@@ -115,18 +112,14 @@ export class OrchestratorConsumer {
       const user = await this.prisma.user.findUniqueOrThrow({
         where: { id: userId },
       });
-      // The token is nullable now (a user can sign in with Google and never link
-      // GitHub). The analyze endpoint gates on it, so this should be unreachable
-      // — but fail the job with a clear reason rather than crashing on decrypt if
-      // a token somehow went missing between enqueue and here.
-      if (!user.githubAccessTokenEncrypted) {
-        throw new Error(
-          'GitHub is not connected for this user — cannot download the repository. Reconnect GitHub and retry.',
-        );
-      }
-      const accessToken = this.tokenEncryption.decrypt(
-        user.githubAccessTokenEncrypted,
-      );
+      // Token is optional: a Google-only user pasting a PUBLIC repo URL has
+      // none, and GitHub's tarball API serves public repos unauthenticated. When
+      // a token is present we use it (private repos + higher rate limit). A
+      // private repo with no token simply 404s the download and the job fails
+      // with a clear reason — no crash.
+      const accessToken = user.githubAccessTokenEncrypted
+        ? this.tokenEncryption.decrypt(user.githubAccessTokenEncrypted)
+        : null;
 
       // The run epoch (bumped by force-stop-and-retry) both fences stale
       // in-flight agent messages AND keys this run's repo directory, so a late
@@ -148,6 +141,28 @@ export class OrchestratorConsumer {
 
       // Pure AST parsing — zero LLM cost.
       const cg = await this.codeGraphService.initAndIndex(repoPath, jobId);
+
+      // CodeGraph writes its SQLite DB only when there's indexable source
+      // (JS/TS/Python/Go). A repo with none — a CSS/HTML-only project like a
+      // pasted gradient generator — leaves no graph, so every downstream query
+      // ENOENTs on the missing DB. That crash otherwise nacks the message and
+      // re-downloads the repo three times into the DLQ. Detect it here and fail
+      // once, clearly, with an ACK (not a nack) so it isn't redelivered.
+      let nodeCount = 0;
+      try {
+        nodeCount = cg.getStats().nodeCount;
+      } catch {
+        nodeCount = 0;
+      }
+      if (nodeCount === 0) {
+        await this.failureRecorder.markFailed(
+          jobId,
+          'No supported source files (JS, TS, Python, or Go) found to analyze in this repository.',
+        );
+        channel.ack(originalMsg);
+        return;
+      }
+
       await this.redis.set(jobGraphPathKey(jobId), repoPath);
 
       // Everything the AST already knows: real routes, real module edges,
@@ -196,7 +211,9 @@ export class OrchestratorConsumer {
       );
       await this.failureRecorder.markFailed(
         jobId,
-        err instanceof TarballDownloadError ? error.message : 'Analysis failed',
+        // Surface the real reason (capped in the recorder) so a failure is
+        // diagnosable, instead of a blanket "Analysis failed".
+        error.message,
       );
       // Don't requeue — a failed download/index won't succeed on redelivery without intervention.
       channel.nack(originalMsg, false, false);

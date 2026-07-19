@@ -14,7 +14,10 @@ async function bootstrap() {
 
   new Logger('Bootstrap').log('ready, waiting for job:*:ready_for_synthesis');
 }
-bootstrap().catch((err) => {
-  new Logger('Bootstrap').error('failed to start', err?.stack);
+bootstrap().catch((err: unknown) => {
+  new Logger('Bootstrap').error(
+    'failed to start',
+    err instanceof Error ? err.stack : undefined,
+  );
   process.exit(1);
 });

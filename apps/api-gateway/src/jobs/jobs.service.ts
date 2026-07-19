@@ -200,7 +200,7 @@ export class JobsService {
 
     await this.prisma.job.update({
       where: { id: jobId },
-      data: { status: 'pending', completedAt: null },
+      data: { status: 'pending', completedAt: null, error: null },
     });
     await this.redis.set(jobStatusKey(jobId), 'pending');
 
@@ -216,7 +216,7 @@ export class JobsService {
       }),
     );
 
-    return { ...job, status: 'pending', completedAt: null };
+    return { ...job, status: 'pending', completedAt: null, error: null };
   }
 
   /**
@@ -255,7 +255,7 @@ export class JobsService {
 
     await this.prisma.job.update({
       where: { id: jobId },
-      data: { status: 'pending', completedAt: null },
+      data: { status: 'pending', completedAt: null, error: null },
     });
     await this.redis.set(jobStatusKey(jobId), 'pending');
 
@@ -269,7 +269,7 @@ export class JobsService {
       }),
     );
 
-    return { ...job, status: 'pending', completedAt: null };
+    return { ...job, status: 'pending', completedAt: null, error: null };
   }
 
   async getLatestAgentResults(jobId: string): Promise<AgentResultSummary[]> {

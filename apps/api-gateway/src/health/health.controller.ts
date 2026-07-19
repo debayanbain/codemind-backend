@@ -27,8 +27,12 @@ export class HealthController {
     ]);
 
     const ok = postgres && redis;
-    res
-      .status(ok ? HttpStatus.OK : HttpStatus.SERVICE_UNAVAILABLE)
-      .json({ status: ok ? 'ok' : 'degraded', postgres, redis });
+    res.status(ok ? HttpStatus.OK : HttpStatus.SERVICE_UNAVAILABLE).json({
+      status: ok ? 'ok' : 'degraded',
+      postgres,
+      redis,
+      service: 'api-gateway',
+      message: 'API Gateway is up and running yayyyy🎉',
+    });
   }
 }

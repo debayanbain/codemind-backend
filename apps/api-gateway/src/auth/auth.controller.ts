@@ -19,8 +19,11 @@ export class AuthController {
   @UseGuards(ClerkAuthGuard)
   async me(@Req() req: Request) {
     const user = req.user as AuthedUser;
+    // Pass the DB-known state as the fallback so a Clerk API blip degrades to
+    // "connected if we've already stored a github_username" instead of 500ing.
     const githubConnected = await this.authService.isGithubConnected(
       user.clerkId,
+      !!user.githubUsername,
     );
     return {
       id: user.id,
