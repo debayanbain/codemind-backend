@@ -29,6 +29,8 @@ import {
   jobTokensUsedKey,
   jobSynthesizingLockKey,
   jobEpochKey,
+  jobEventsChannel,
+  JobEventPayload,
 } from '@app/common';
 
 export const ANALYSIS_QUEUE_CLIENT = 'ANALYSIS_QUEUE_CLIENT';
@@ -270,6 +272,68 @@ export class JobsService {
     );
 
     return { ...job, status: 'pending', completedAt: null, error: null };
+  }
+
+  /**
+   * Abort a pending/running job outright. Unlike forceStopAndRetry, this does
+   * NOT re-dispatch — it moves the job to the terminal `cancelled` state and
+   * leaves it there. This is the "I clicked Analyze by mistake" escape hatch.
+   *
+   * Same fencing mechanism as forceStopAndRetry: bumping `job:{id}:epoch`
+   * neutralises the old run. Any agent still in its tool loop trips
+   * EpochFencedError on its next turn and stops spending tokens; any message
+   * still queued is dropped by the worker's pre-flight epoch check. We can't
+   * hard-kill an in-flight LLM call or purge one job's messages from the shared
+   * queues, so fencing is the abort.
+   */
+  async cancelJob(jobId: string, userId: string): Promise<Job> {
+    const job = await this.prisma.job.findUnique({ where: { id: jobId } });
+    if (!job || job.userId !== userId) {
+      throw new NotFoundException('Job not found');
+    }
+
+    // Only an in-progress job can be cancelled — a done/failed/already-cancelled
+    // job is terminal, and re-cancelling would wipe a finished job's state.
+    if (job.status !== 'pending' && job.status !== 'running') {
+      throw new BadRequestException(
+        'Only a pending or running job can be cancelled',
+      );
+    }
+
+    // Fence first: bump the epoch so nothing from this run can advance
+    // completion or write a result after the state wipe below.
+    await this.redis.incr(jobEpochKey(jobId));
+
+    // Tear down per-run state. Notably clears agents_done/expected so a racing
+    // agent that finished between its last fence check and its SADD can't push
+    // the (now empty) done-set to completion and trip synthesis for a job the
+    // user just abandoned. The synthesizer also re-checks status as a backstop.
+    await this.redis.del(
+      jobAgentsDoneKey(jobId),
+      jobAgentsExpectedKey(jobId),
+      jobGraphPathKey(jobId),
+      jobTokensUsedKey(jobId),
+      jobSynthesizingLockKey(jobId),
+    );
+
+    const completedAt = new Date();
+    await this.prisma.job.update({
+      where: { id: jobId },
+      data: { status: 'cancelled', completedAt, error: 'Cancelled by user' },
+    });
+    await this.redis.set(jobStatusKey(jobId), 'cancelled');
+
+    // Push the terminal status to any open dashboard immediately; the frontend
+    // also polls, so a dropped event just costs a few seconds. Reuses the
+    // generic job:status event the socket gateway already relays.
+    const event: JobEventPayload = {
+      type: 'job:status',
+      jobId,
+      status: 'cancelled',
+    };
+    await this.redis.publish(jobEventsChannel(jobId), JSON.stringify(event));
+
+    return { ...job, status: 'cancelled', completedAt, error: 'Cancelled by user' };
   }
 
   async getLatestAgentResults(jobId: string): Promise<AgentResultSummary[]> {

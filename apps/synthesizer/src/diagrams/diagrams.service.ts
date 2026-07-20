@@ -134,6 +134,11 @@ export class DiagramsService {
         (degraded.length ? ` | degraded: ${degraded.join(', ')}` : ''),
     );
 
+    // Reclaim the D2 WASM worker's linear memory now that this report's diagrams
+    // are rendered. Left reused across jobs it ratchets up until the container is
+    // OOM-killed and the whole service silently dies — see D2Renderer.recycle.
+    await this.renderer.recycle();
+
     return diagrams;
   }
 

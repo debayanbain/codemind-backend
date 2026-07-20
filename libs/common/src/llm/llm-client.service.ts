@@ -114,7 +114,10 @@ export class LlmClient {
     // Build only the clients the two active providers actually need. With both
     // on Mistral, Anthropic is never constructed — so a commented-out
     // ANTHROPIC_API_KEY is fine and makes no calls.
-    if (this.synthesisProvider === 'openai') {
+    if (
+      this.synthesisProvider === 'openai' ||
+      this.agentProvider === 'openai'
+    ) {
       this.openaiClient = new OpenAI({ maxRetries: LLM_MAX_RETRIES });
     }
     if (
@@ -208,8 +211,14 @@ export class LlmClient {
    * — stays provider-agnostic and unchanged.
    */
   async converse(params: LlmConverseParams): Promise<LlmConverseResult> {
+    // Mistral and OpenAI share the chat-completions + tool-calling dialect (the
+    // Mistral client IS the OpenAI SDK), so both go through one translator —
+    // only the client and model id differ. Anthropic keeps its own branch below.
     if (this.agentProvider === 'mistral') {
-      return this.converseMistral(params);
+      return this.converseOpenAiDialect(this.mistralClient!, params);
+    }
+    if (this.agentProvider === 'openai') {
+      return this.converseOpenAiDialect(this.openaiClient!, params);
     }
 
     // Sonnet 4.6 accepts adaptive thinking and `output_config.effort`, but
@@ -251,20 +260,22 @@ export class LlmClient {
   }
 
   /**
-   * The Mistral implementation of `converse`.
+   * The OpenAI-dialect implementation of `converse`, shared by Mistral and
+   * OpenAI — both are driven by the `openai` SDK, so only the client and model
+   * id differ. This is what makes the agent provider a one-line switch.
    *
-   * Mistral has no adaptive thinking, no `effort`, and no prompt-cache markers —
-   * so `params.thinking`, `params.effort`, and the `cache_control` blocks the
-   * loop stamps on messages are simply dropped in translation. They cost nothing
-   * to ignore: caching is a price optimisation, thinking is a depth knob, and
+   * Neither has adaptive thinking, `effort`, or prompt-cache markers — so
+   * `params.thinking`, `params.effort`, and the `cache_control` blocks the loop
+   * stamps on messages are simply dropped in translation. They cost nothing to
+   * ignore: caching is a price optimisation, thinking is a depth knob, and
    * neither changes the loop's contract.
    *
-   * `strict` on the emit tool is Anthropic-only and is *not* forwarded — Mistral
-   * doesn't enforce it the same way, and the loop already re-validates the
-   * emitted payload and grants one repair turn, so a missing field degrades to a
-   * cheap correction rather than a hard failure.
+   * `strict` on the emit tool is Anthropic-only and is *not* forwarded — the
+   * loop already re-validates the emitted payload and grants one repair turn, so
+   * a missing field degrades to a cheap correction rather than a hard failure.
    */
-  private async converseMistral(
+  private async converseOpenAiDialect(
+    client: OpenAI,
     params: LlmConverseParams,
   ): Promise<LlmConverseResult> {
     const body: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming =
@@ -284,7 +295,7 @@ export class LlmClient {
           : {}),
       };
 
-    const response = await this.mistralClient!.chat.completions.create(body);
+    const response = await client.chat.completions.create(body);
     const choice = response.choices[0];
     const message = choice?.message;
 

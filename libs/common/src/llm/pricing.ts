@@ -31,57 +31,75 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> =
     'mistral-medium-latest': { input: 0.4, output: 2 },
     'mistral-small-latest': { input: 0.2, output: 0.6 },
     'codestral-latest': { input: 0.3, output: 0.9 },
+    // OpenAI runs the agent tool-loop now; published $/1M as of this build.
+    'gpt-4o-mini': { input: 0.15, output: 0.6 },
+    'gpt-4o': { input: 2.5, output: 10 },
   };
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_MISTRAL_AGENT_MODEL = 'mistral-large-latest';
 const DEFAULT_MISTRAL_SYNTHESIS_MODEL = 'mistral-large-latest';
 
-export type AgentProvider = 'anthropic' | 'mistral';
+export type AgentProvider = 'anthropic' | 'mistral' | 'openai';
 export type CompletionProvider = 'anthropic' | 'openai' | 'mistral';
 
-/**
- * Which provider runs the agent tool-loop (`LlmClient.converse`).
- *
- * Independent of the synthesis provider — the two paths pick their provider
- * separately. For this build both run on Mistral (Anthropic is dormant, kept so
- * it can be re-enabled). Explicit `AGENT_LLM_PROVIDER` wins; otherwise a Mistral
- * key is the signal.
- */
-export const resolveAgentProvider = (): AgentProvider => {
-  const pref = process.env.AGENT_LLM_PROVIDER?.toLowerCase();
-  if (pref === 'anthropic') return 'anthropic';
-  if (pref === 'mistral') return 'mistral';
-  return process.env.MISTRAL_API_KEY ? 'mistral' : 'anthropic';
+/** Every provider the system can drive. Add one here + a model case + a client. */
+export const KNOWN_PROVIDERS = ['anthropic', 'mistral', 'openai'] as const;
+
+/** Env value → a known provider, or null if unset/unrecognised. */
+const parseProvider = (v: string | undefined): CompletionProvider | null => {
+  const p = v?.toLowerCase() ?? '';
+  return (KNOWN_PROVIDERS as readonly string[]).includes(p)
+    ? (p as CompletionProvider)
+    : null;
 };
 
 /**
- * Which provider runs the single synthesis call (`LlmClient.complete`).
- *
- * `SYNTHESIS_LLM_PROVIDER` wins, falling back to the legacy `LLM_PROVIDER`; with
- * neither set, a Mistral key means Mistral. The full-Mistral build routes
- * synthesis here too so Anthropic makes zero calls — the Anthropic branch stays
- * in `complete()`, dormant, to switch back later.
+ * The system-wide default provider — the single `LLM_PROVIDER` switch. Flip it
+ * and BOTH the agent tool-loop AND the synthesis call move to that provider at
+ * once. With it unset, whichever API key is present decides. This is the "one
+ * option switches the whole system's LLM" knob.
  */
-export const resolveSynthesisProvider = (): CompletionProvider => {
-  const pref = (
-    process.env.SYNTHESIS_LLM_PROVIDER ?? process.env.LLM_PROVIDER
-  )?.toLowerCase();
-  if (pref === 'mistral') return 'mistral';
-  if (pref === 'openai') return 'openai';
-  if (pref === 'anthropic') return 'anthropic';
-  return process.env.MISTRAL_API_KEY ? 'mistral' : 'anthropic';
-};
+const defaultProvider = (): CompletionProvider =>
+  parseProvider(process.env.LLM_PROVIDER) ??
+  (process.env.OPENAI_API_KEY
+    ? 'openai'
+    : process.env.MISTRAL_API_KEY
+      ? 'mistral'
+      : 'anthropic');
+
+/**
+ * Which provider runs the agent tool-loop (`LlmClient.converse`). Defaults to
+ * the system-wide `LLM_PROVIDER`; set `AGENT_LLM_PROVIDER` only to run the
+ * agents on a different provider than synthesis (e.g. cheap agents on OpenAI,
+ * synthesis on Mistral).
+ */
+export const resolveAgentProvider = (): AgentProvider =>
+  parseProvider(process.env.AGENT_LLM_PROVIDER) ?? defaultProvider();
+
+/**
+ * Which provider runs the single synthesis call (`LlmClient.complete`). Defaults
+ * to the system-wide `LLM_PROVIDER`; set `SYNTHESIS_LLM_PROVIDER` to override it
+ * independently of the agents.
+ */
+export const resolveSynthesisProvider = (): CompletionProvider =>
+  parseProvider(process.env.SYNTHESIS_LLM_PROVIDER) ?? defaultProvider();
 
 /**
  * The model the agents actually run, for pricing and for display. Follows the
  * active agent provider so the cost the report shows is priced against the
  * model that produced the tokens.
  */
-export const agentModel = (): string =>
-  resolveAgentProvider() === 'mistral'
-    ? (process.env.MISTRAL_AGENT_MODEL ?? DEFAULT_MISTRAL_AGENT_MODEL)
-    : (process.env.ANTHROPIC_AGENT_MODEL ?? DEFAULT_MODEL);
+export const agentModel = (): string => {
+  switch (resolveAgentProvider()) {
+    case 'mistral':
+      return process.env.MISTRAL_AGENT_MODEL ?? DEFAULT_MISTRAL_AGENT_MODEL;
+    case 'openai':
+      return process.env.OPENAI_AGENT_MODEL ?? 'gpt-4o-mini';
+    default:
+      return process.env.ANTHROPIC_AGENT_MODEL ?? DEFAULT_MODEL;
+  }
+};
 
 /** The model the synthesis call runs, following the active synthesis provider. */
 export const synthesisModel = (): string => {

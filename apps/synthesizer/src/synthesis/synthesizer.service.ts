@@ -42,6 +42,15 @@ const MISTRAL_SYNTHESIS_MODEL =
  */
 const SWEEP_INTERVAL_MS = 30_000;
 
+/**
+ * When Redis's completion counters have lapsed — evicted, or expired while this
+ * process was down long enough (e.g. an OOM kill) — a `running` job that already
+ * has agent results in Postgres and is older than this is treated as stalled and
+ * recovered from durable state. Long enough that a just-dispatched job whose
+ * agents are still running is never pre-empted.
+ */
+const STALLED_MIN_AGE_MS = 5 * 60_000; // 5 min
+
 @Injectable()
 export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SynthesizerService.name);
@@ -108,21 +117,36 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
   private async sweepStalledJobs(): Promise<void> {
     const running = await this.prisma.job.findMany({
       where: { status: 'running' },
-      select: { id: true },
+      select: { id: true, createdAt: true },
     });
 
-    for (const { id: jobId } of running) {
+    for (const { id: jobId, createdAt } of running) {
       try {
         const [done, expected] = await Promise.all([
           this.redis.scard(jobAgentsDoneKey(jobId)),
           this.redis.scard(jobAgentsExpectedKey(jobId)),
         ]);
-        // expected === 0 means the orchestrator hasn't dispatched yet — the job
-        // is early, not stalled.
-        if (expected === 0 || done < expected) continue;
+
+        if (expected > 0) {
+          // Fast path: Redis still holds the completion counters.
+          if (done < expected) continue;
+        } else {
+          // Redis counters are gone — evicted, or lapsed while this process was
+          // down (an OOM kill can strand a job here for hours). Fall back to
+          // DURABLE Postgres so the job stays recoverable: synthesize only if it
+          // already has agent results AND is old enough to be genuinely stalled,
+          // so a just-dispatched job whose agents are still running is never
+          // pre-empted.
+          const agentCount = await this.prisma.agentResult.count({
+            where: { jobId },
+          });
+          const stalledLongEnough =
+            Date.now() - createdAt.getTime() > STALLED_MIN_AGE_MS;
+          if (agentCount === 0 || !stalledLongEnough) continue;
+        }
 
         this.logger.warn(
-          `Recovering stalled job — agents complete (${done}/${expected}) but never synthesized [job=${jobId}]`,
+          `Recovering stalled job — agents done but never synthesized [job=${jobId}]`,
         );
         await this.synthesize(jobId);
       } catch (err: unknown) {
@@ -163,6 +187,23 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
     if (existing) {
       this.logger.warn(
         `Synthesis re-triggered for a job that already has a report — ignoring [job=${jobId}]`,
+      );
+      return;
+    }
+
+    // Resurrection guard. A cancel bumps the epoch and wipes the completion
+    // counters, but an agent that finished between its last fence check and its
+    // SADD can still push the (freshly wiped) done-set to completion and publish
+    // ready_for_synthesis. Without this check that would mint a report for a job
+    // the user explicitly abandoned and flip it back to `done`. The DB status is
+    // the durable source of truth for "the user cancelled".
+    const current = await this.prisma.job.findUnique({
+      where: { id: jobId },
+      select: { status: true },
+    });
+    if (current?.status === 'cancelled') {
+      this.logger.warn(
+        `Synthesis skipped — job was cancelled by the user [job=${jobId}]`,
       );
       return;
     }

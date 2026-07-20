@@ -21,6 +21,9 @@ enum JobStatus {
   running
   done
   failed
+  // User aborted a pending/running job. Terminal, like done/failed, but never
+  // produces a report — the run is fenced (epoch bumped) and not re-dispatched.
+  cancelled
 }
 
 enum AgentType {

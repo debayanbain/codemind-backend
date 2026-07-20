@@ -78,6 +78,14 @@ const RESERVE_TOKENS = 8_000;
  * re-discovering the module list is spending the budget on the one part that was
  * already free.
  */
+// Reject an emit that arrives before this fraction of the turn budget is spent,
+// nudging the agent to investigate thoroughly instead of answering shallowly on
+// turn 1-2. Bounded by maxTurns so the loop always terminates. Env-tunable; set
+// 0 to disable (emit as soon as the model is ready).
+const MIN_EVIDENCE_FRACTION = Number(
+  process.env.AGENT_MIN_EVIDENCE_FRACTION ?? 0.6,
+);
+
 const LOOP_PREAMBLE = (agentType: string, maxTurns: number) =>
   `You are analysing a codebase you have never seen. You have read-only tools over a
 pre-built code graph and the checkout itself. Use them.
@@ -99,6 +107,9 @@ How to work:
   tool calls in one turn is normal and cheaper than one at a time.
 
 How to finish:
+- Do not emit early. A two-turn answer is a shallow one. Investigate thoroughly —
+  read the important files, trace the main flows, verify claims at file:line — and
+  use most of your ${maxTurns}-turn budget before you emit.
 - Call emit_${agentType} with your findings. Its schema defines the required shape.
 - Be concrete and specific. "Error handling is inconsistent" is worthless; "12 of 19
   handlers in orchestrator.consumer.ts swallow errors with a bare catch (see :127)"
@@ -187,6 +198,12 @@ export abstract class BaseAgent {
     // One extra turn, granted only to repair a schema-invalid emit (see the
     // rejection path below). Not part of the investigation budget.
     let repairTurns = 0;
+    // Investigation-depth floor — see MIN_EVIDENCE_FRACTION. Capped at
+    // maxTurns-1 so the final turn can always force the emit.
+    const minEvidenceTurns = Math.min(
+      this.maxTurns - 1,
+      Math.ceil(this.maxTurns * MIN_EVIDENCE_FRACTION),
+    );
 
     try {
       for (let turn = 1; turn <= this.maxTurns + repairTurns; turn++) {
@@ -283,6 +300,38 @@ export abstract class BaseAgent {
                     `Call ${emitTool.name} again with EVERY required field present. ` +
                     `Base it on what you already read; do not gather more evidence. ` +
                     `If you genuinely found nothing for a required list, send an empty array.`,
+                },
+              ],
+            });
+            continue;
+          }
+
+          // Minimum-evidence gate: reject an emit that lands before the depth
+          // floor so the agent keeps investigating instead of answering shallowly
+          // on turn 1-2. Never blocks a forced (mustFinish) or budget-limited
+          // emit, and `turn` is monotonic so this converges to `minEvidenceTurns`
+          // and always terminates.
+          const tooEarly =
+            !mustFinish &&
+            turn < minEvidenceTurns &&
+            remaining > RESERVE_TOKENS;
+          if (tooEarly) {
+            this.logger.debug(
+              `[${this.agentType}] emit on turn ${turn} below evidence floor ${minEvidenceTurns} — pushing for more`,
+            );
+            messages.push({ role: 'assistant', content: res.content });
+            messages.push({
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: emit.id,
+                  is_error: true,
+                  content:
+                    `Not yet — you have used only ${turn} of ~${this.maxTurns} turns. ` +
+                    `Keep investigating before you emit: read the important files, ` +
+                    `trace the main flows, and verify each claim at file:line. Gather ` +
+                    `substantially more evidence, THEN call ${emitTool.name}.`,
                 },
               ],
             });

@@ -57,6 +57,26 @@ interface AckableChannel {
 export class AgentConsumer {
   private readonly logger = new Logger(AgentConsumer.name);
 
+  // Execution gate shared by all 5 agent consumers — see the constructor.
+  private readonly maxConcurrentAgents: number;
+  private availableSlots: number;
+  private readonly slotWaiters: Array<{
+    agentType: AgentType;
+    resolve: () => void;
+  }> = [];
+  private grantTimer: NodeJS.Timeout | null = null;
+
+  // Fixed pipeline order — agents run one-by-one in THIS order regardless of
+  // which RabbitMQ queue happens to deliver first, so the pipeline lights up
+  // top-to-bottom (architecture first) rather than in arbitrary arrival order.
+  private static readonly ORDER: AgentType[] = [
+    'architecture',
+    'security',
+    'dependency',
+    'quality',
+    'docs',
+  ];
+
   constructor(
     private readonly codeGraphService: CodeGraphService,
     private readonly architectureAgent: ArchitectureAgent,
@@ -68,7 +88,64 @@ export class AgentConsumer {
     @InjectRedis() private readonly redis: Redis,
     private readonly config: ConfigService,
     private readonly failureRecorder: AgentFailureRecorderService,
-  ) {}
+  ) {
+    // How many agents may run at once across ALL five consumers. Default 1 =
+    // strictly one-by-one: Mistral's low-tier rate limit 429s when five agents
+    // call concurrently, and a 429-killed agent wastes the tokens it already
+    // spent before its retry re-spends them. One at a time removes the burst.
+    // Raise AGENT_CONCURRENCY on a higher tier to reclaim parallelism.
+    this.maxConcurrentAgents = Math.max(
+      1,
+      this.config.get<number>('AGENT_CONCURRENCY', 1),
+    );
+    this.availableSlots = this.maxConcurrentAgents;
+    this.logger.log(`Agent execution concurrency: ${this.maxConcurrentAgents}`);
+  }
+
+  // A job's five agents are dispatched together but arrive across five queues a
+  // few ms apart. Hold the first grant this long so they all register as waiters
+  // before we pick the earliest in ORDER — otherwise whichever queue delivered
+  // first would win the slot. Small enough to be imperceptible.
+  private static readonly SLOT_COLLECT_MS = 150;
+
+  /**
+   * Enqueue for an execution slot. Grants are made in fixed pipeline ORDER, not
+   * arrival order: the first grant waits SLOT_COLLECT_MS for the whole batch to
+   * register, and every grant after that (on release) picks the earliest
+   * still-waiting agent in ORDER. So execution is deterministic — architecture,
+   * then security, dependency, quality, docs — regardless of queue delivery.
+   */
+  private acquireSlot(agentType: AgentType): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.slotWaiters.push({ agentType, resolve });
+      if (this.grantTimer === null) {
+        this.grantTimer = setTimeout(() => {
+          this.grantTimer = null;
+          this.grantNext();
+        }, AgentConsumer.SLOT_COLLECT_MS);
+      }
+    });
+  }
+
+  /** Hand each free slot to the waiting agent earliest in ORDER. */
+  private grantNext(): void {
+    while (this.availableSlots > 0 && this.slotWaiters.length > 0) {
+      this.slotWaiters.sort(
+        (a, b) =>
+          AgentConsumer.ORDER.indexOf(a.agentType) -
+          AgentConsumer.ORDER.indexOf(b.agentType),
+      );
+      const next = this.slotWaiters.shift()!;
+      this.availableSlots--;
+      next.resolve();
+    }
+  }
+
+  /** Return a slot and immediately hand it to the next agent in ORDER. */
+  private releaseSlot(): void {
+    this.availableSlots++;
+    this.grantNext();
+  }
 
   @EventPattern(AGENT_ROUTING_KEYS.architecture)
   async onArchitecture(
@@ -130,6 +207,12 @@ export class AgentConsumer {
     const originalMsg = ctx.getMessage();
     const { jobId, repoPath, agentType } = msg;
 
+    // Wait for a free execution slot so agents run one-by-one (see constructor)
+    // instead of all bursting Mistral's rate limit at once. The message sits
+    // unacked in the queue meanwhile — which is the point: it isn't started
+    // until there's capacity.
+    this.logger.log(`[${agentType}] queued job=${jobId}`);
+    await this.acquireSlot(agentType);
     this.logger.log(`[${agentType}] starting job=${jobId}`);
 
     try {
@@ -317,6 +400,10 @@ export class AgentConsumer {
           );
         });
       channel.nack(originalMsg, false, false);
+    } finally {
+      // Release the slot however the handler exited (ack, nack, fence, throw)
+      // so the next queued agent can start.
+      this.releaseSlot();
     }
   }
 

@@ -57,6 +57,29 @@ export class D2Renderer implements OnModuleDestroy {
   }
 
   /**
+   * Tear down the WASM instance between reports so its worker thread's linear
+   * memory is reclaimed; the next render lazily boots a fresh one (~1.5s).
+   *
+   * D2 is Go compiled to WASM running in a worker thread, and that linear
+   * memory lives OUTSIDE V8's heap — so `--max-old-space-size` cannot bound it,
+   * and WebAssembly.Memory only ever grows, never shrinks. Reused for the whole
+   * process lifetime (the norm — it's only torn down on a render error), it
+   * ratchets up job after job until the container is OOM-killed. That kill is
+   * silent and unrecoverable in dev: `nest start --watch` does not restart the
+   * killed child, so the container stays "Up" with a dead app and every later
+   * job hangs at "synthesizing" forever. Recycling at each job boundary caps the
+   * peak at one report's worth of renders instead of letting it accumulate.
+   *
+   * Routed through the same lock as render(), so it can never interleave with an
+   * in-flight compile.
+   */
+  async recycle(): Promise<void> {
+    await this.serialize(async () => {
+      await this.terminate();
+    });
+  }
+
+  /**
    * Renders D2 source to a standalone SVG string.
    *
    * Never throws: a diagram that won't compile becomes a visible placeholder.

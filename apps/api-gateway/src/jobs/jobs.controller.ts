@@ -46,6 +46,17 @@ export class JobsController {
     return { jobId: job.id, status: job.status };
   }
 
+  // Cancel a pending/running job outright — fences the run and marks it
+  // `cancelled`, with no re-dispatch. Deliberately NOT behind JobRateLimitGuard:
+  // it enqueues no new work, and a user must always be able to abort a run they
+  // started by mistake.
+  @Post(':id/cancel')
+  async cancelJob(@Param('id') id: string, @Req() req: Request) {
+    const userId = (req.user as { id: string }).id;
+    const job = await this.jobsService.cancelJob(id, userId);
+    return { jobId: job.id, status: job.status };
+  }
+
   /** The live share link for this job, or null if the owner never made one. */
   @Get(':id/share')
   async getShareLink(@Param('id') id: string, @Req() req: Request) {
