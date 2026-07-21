@@ -13,7 +13,7 @@ import {
 import { OrchestratorConsumer } from './jobs/orchestrator.consumer';
 import { AnalysisDlqConsumer } from './jobs/analysis-dlq.consumer';
 import { JobFailureRecorderService } from './jobs/job-failure-recorder.service';
-import { GithubTarballService } from './github/github-tarball.service';
+import { GithubTarballService } from '@app/common';
 import { RepoManifestService } from './manifest/repo-manifest.service';
 import { RepoFactsService } from './facts/repo-facts.service';
 import {

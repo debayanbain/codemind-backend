@@ -42,6 +42,12 @@ export class GithubTarballService {
       this.config.get<number>('MAX_REPO_SIZE_MB', 200) * 1024 * 1024;
     const maxFiles = this.config.get<number>('MAX_REPO_FILE_COUNT', 5000);
 
+    // Completed checkouts are now retained (not deleted post-job) so the repo
+    // chat can re-open the CodeGraph read-only. Bound that retention here: keep
+    // only the most recently-touched N checkouts, so /tmp/repos can't grow
+    // without limit. The current runKey is never pruned.
+    await this.pruneOldCheckouts(runKey);
+
     await fsp.mkdir(repoPath, { recursive: true });
 
     try {
@@ -118,6 +124,57 @@ export class GithubTarballService {
       throw err;
     } finally {
       await fsp.rm(archivePath, { force: true });
+    }
+  }
+
+  /**
+   * Keep only the most recently-touched N checkouts under /tmp/repos, deleting
+   * older ones so retained graphs (kept for the repo chat) can't grow disk
+   * without bound. The current run's dir is never pruned; stray `.tar.gz`
+   * archives from interrupted extracts are swept too. Best-effort — a prune
+   * failure never blocks the extraction.
+   */
+  private async pruneOldCheckouts(currentRunKey: string): Promise<void> {
+    const keep = this.config.get<number>('MAX_RETAINED_CHECKOUTS', 12);
+    try {
+      const entries = await fsp.readdir(REPOS_TMP_DIR, { withFileTypes: true });
+      const dirs: { path: string; mtime: number }[] = [];
+
+      for (const entry of entries) {
+        const full = path.join(REPOS_TMP_DIR, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === currentRunKey) continue;
+          try {
+            const st = await fsp.stat(full);
+            dirs.push({ path: full, mtime: st.mtimeMs });
+          } catch {
+            /* vanished between readdir and stat — ignore */
+          }
+        } else if (entry.name.endsWith('.tar.gz')) {
+          await fsp.rm(full, { force: true }).catch(() => undefined);
+        }
+      }
+
+      // Newest first; reserve one slot for the checkout about to be created.
+      dirs.sort((a, b) => b.mtime - a.mtime);
+      const stale = dirs.slice(Math.max(0, keep - 1));
+      for (const d of stale) {
+        await fsp
+          .rm(d.path, { recursive: true, force: true })
+          .catch((e: unknown) =>
+            this.logger.warn(
+              `Failed to prune old checkout ${d.path}: ${String(e)}`,
+            ),
+          );
+      }
+      if (stale.length) {
+        this.logger.log(
+          `Pruned ${stale.length} old checkout(s) from ${REPOS_TMP_DIR}`,
+        );
+      }
+    } catch (err) {
+      // /tmp/repos may not exist yet on the very first run — nothing to prune.
+      this.logger.debug(`Checkout prune skipped: ${String(err)}`);
     }
   }
 

@@ -3,7 +3,9 @@ import {
   InternalServerErrorException,
   Logger,
 } from '@nestjs/common';
-import { PrismaService, JobStatus } from '@app/common';
+import { InjectRedis } from '@nestjs-modules/ioredis';
+import Redis from 'ioredis';
+import { PrismaService, JobStatus, userReposCacheKey } from '@app/common';
 import { AuthService } from '../auth/auth.service';
 
 export interface LanguageStat {
@@ -33,6 +35,13 @@ const MAX_LANGUAGES = 6;
 const REPOS_PER_PAGE = 100;
 // Safety valve so a runaway account can't loop forever.
 const MAX_PAGES = 20;
+
+// How long the GitHub repo listing is cached per user. Short enough that a new
+// repo shows up within a few minutes; long enough that rapid page refreshes
+// don't re-hit GitHub each time. The live job-status overlay is never cached.
+const REPOS_CACHE_TTL_SECONDS = Number(
+  process.env.REPOS_CACHE_TTL_SECONDS ?? 300,
+);
 
 interface GraphQlLanguageEdge {
   size: number;
@@ -102,14 +111,23 @@ export class ReposService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly authService: AuthService,
+    @InjectRedis() private readonly redis: Redis,
   ) {}
 
-  async listRepos(userId: string): Promise<GithubRepoSummary[]> {
-    // Fetch a fresh GitHub token from Clerk (and persist it encrypted). Throws
-    // 409 github_not_connected for a user with no linked GitHub — the frontend
-    // shows the Connect GitHub card instead of an empty/failed list.
-    const token = await this.authService.ensureGithubToken(userId);
-    const nodes = await this.fetchAllRepoNodes(token);
+  /**
+   * List the user's repos, with each repo's latest job status.
+   *
+   * The GitHub GraphQL fetch (the slow part) is cached in Redis per user for a
+   * few minutes, so hammering refresh on the dashboard doesn't re-hit GitHub
+   * every time. The per-repo job-status overlay is always recomputed from
+   * Postgres, so a just-finished (or just-started) analysis shows immediately
+   * even on a cache hit. Pass `forceRefresh` to bypass and rebuild the cache.
+   */
+  async listRepos(
+    userId: string,
+    forceRefresh = false,
+  ): Promise<GithubRepoSummary[]> {
+    const nodes = await this.getRepoNodes(userId, forceRefresh);
 
     const lastJobByRepo = await this.getLastJobsByRepo(
       userId,
@@ -140,6 +158,64 @@ export class ReposService {
           };
         })
     );
+  }
+
+  /**
+   * The user's GitHub repo nodes — from Redis when warm, otherwise fetched from
+   * GitHub and cached. On a cache miss we also refresh the stored GitHub token
+   * (ensureGithubToken persists it + backfills identity); on a hit we skip that,
+   * which is safe because the analyze path refreshes the token independently.
+   */
+  private async getRepoNodes(
+    userId: string,
+    forceRefresh: boolean,
+  ): Promise<GraphQlRepoNode[]> {
+    const cacheKey = userReposCacheKey(userId);
+
+    if (!forceRefresh) {
+      const cached = await this.readCache(cacheKey);
+      if (cached) {
+        this.logger.debug(`repos cache hit for user ${userId}`);
+        return cached;
+      }
+    }
+
+    // Fetch a fresh GitHub token from Clerk (and persist it encrypted). Throws
+    // 409 github_not_connected for a user with no linked GitHub — the frontend
+    // shows the Connect GitHub card instead of an empty/failed list.
+    const token = await this.authService.ensureGithubToken(userId);
+    const nodes = await this.fetchAllRepoNodes(token);
+
+    // Cache write is best-effort — a Redis blip must never fail a repo listing.
+    try {
+      await this.redis.set(
+        cacheKey,
+        JSON.stringify(nodes),
+        'EX',
+        REPOS_CACHE_TTL_SECONDS,
+      );
+    } catch (err) {
+      this.logger.warn(`Failed to cache repos for ${userId}: ${String(err)}`);
+    }
+
+    return nodes;
+  }
+
+  /** Read + parse the cached nodes, tolerating a corrupt/legacy entry. */
+  private async readCache(cacheKey: string): Promise<GraphQlRepoNode[] | null> {
+    try {
+      const raw = await this.redis.get(cacheKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as GraphQlRepoNode[];
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Drop a user's cached repo listing so the next read rebuilds it. */
+  async invalidateReposCache(userId: string): Promise<void> {
+    await this.redis.del(userReposCacheKey(userId));
   }
 
   /** Page through the GraphQL repositories connection until exhausted. */

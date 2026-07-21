@@ -29,6 +29,13 @@ export interface LlmCompleteParams {
   openaiModel: string;
   mistralModel: string;
   maxTokens: number;
+  /**
+   * Override the provider for this one call, independent of `LLM_PROVIDER`.
+   * Lets a single feature (e.g. repo chat) run on OpenAI while the synthesis /
+   * agents stay on their configured provider. The matching client is built
+   * lazily. Omit to use the configured synthesis provider.
+   */
+  provider?: AgentProvider;
 }
 
 export interface LlmCompleteResult {
@@ -77,6 +84,13 @@ export interface LlmConverseParams {
   thinking?: boolean;
   /** Sonnet 4.6 defaults to `high`; we pay for that unless we say otherwise. */
   effort?: 'low' | 'medium' | 'high' | 'max';
+  /**
+   * Override the provider for this one call, independent of `AGENT_LLM_PROVIDER`.
+   * Lets repo chat run the tool loop on OpenAI while the extraction agents stay
+   * on their configured provider. The matching client is built lazily. Omit to
+   * use the configured agent provider.
+   */
+  provider?: AgentProvider;
 }
 
 export interface LlmConverseResult {
@@ -103,9 +117,12 @@ export class LlmClient {
   private readonly logger = new Logger(LlmClient.name);
   private readonly synthesisProvider: CompletionProvider;
   private readonly agentProvider: AgentProvider;
-  private readonly anthropicClient?: Anthropic;
-  private readonly openaiClient?: OpenAI;
-  private readonly mistralClient?: OpenAI;
+  // Not readonly: a per-call `provider` override can lazily build a client the
+  // configured providers didn't (e.g. chat forces OpenAI while agents run on
+  // Mistral). See ensure* below.
+  private anthropicClient?: Anthropic;
+  private openaiClient?: OpenAI;
+  private mistralClient?: OpenAI;
 
   constructor() {
     this.synthesisProvider = resolveSynthesisProvider();
@@ -148,22 +165,41 @@ export class LlmClient {
     );
   }
 
+  /** Lazily build (and cache) the client for a provider — used by per-call
+   *  provider overrides that the constructor didn't pre-build. */
+  private ensureAnthropic(): Anthropic {
+    return (this.anthropicClient ??= new Anthropic({
+      maxRetries: LLM_MAX_RETRIES,
+    }));
+  }
+
+  private ensureOpenAi(): OpenAI {
+    return (this.openaiClient ??= new OpenAI({ maxRetries: LLM_MAX_RETRIES }));
+  }
+
+  private ensureMistral(): OpenAI {
+    if (this.mistralClient) return this.mistralClient;
+    const apiKey = process.env.MISTRAL_API_KEY;
+    if (!apiKey) {
+      throw new Error('MISTRAL_API_KEY is not set but a Mistral call was made.');
+    }
+    return (this.mistralClient = new OpenAI({
+      apiKey,
+      baseURL: MISTRAL_BASE_URL,
+      maxRetries: LLM_MAX_RETRIES,
+    }));
+  }
+
   async complete(params: LlmCompleteParams): Promise<LlmCompleteResult> {
+    const provider = params.provider ?? this.synthesisProvider;
     // Mistral and OpenAI share the chat-completions shape; only the client and
     // model id differ. Anthropic stays as its own branch — dormant while the
     // build is full-Mistral, one env flip away from active again.
-    if (
-      this.synthesisProvider === 'mistral' ||
-      this.synthesisProvider === 'openai'
-    ) {
+    if (provider === 'mistral' || provider === 'openai') {
       const client =
-        this.synthesisProvider === 'mistral'
-          ? this.mistralClient!
-          : this.openaiClient!;
+        provider === 'mistral' ? this.ensureMistral() : this.ensureOpenAi();
       const model =
-        this.synthesisProvider === 'mistral'
-          ? params.mistralModel
-          : params.openaiModel;
+        provider === 'mistral' ? params.mistralModel : params.openaiModel;
       const response = await client.chat.completions.create({
         model,
         max_tokens: params.maxTokens,
@@ -182,7 +218,7 @@ export class LlmClient {
       };
     }
 
-    const response = await this.anthropicClient!.messages.create({
+    const response = await this.ensureAnthropic().messages.create({
       model: params.anthropicModel,
       max_tokens: params.maxTokens,
       system: params.system,
@@ -211,14 +247,16 @@ export class LlmClient {
    * — stays provider-agnostic and unchanged.
    */
   async converse(params: LlmConverseParams): Promise<LlmConverseResult> {
+    const provider = params.provider ?? this.agentProvider;
+
     // Mistral and OpenAI share the chat-completions + tool-calling dialect (the
     // Mistral client IS the OpenAI SDK), so both go through one translator —
     // only the client and model id differ. Anthropic keeps its own branch below.
-    if (this.agentProvider === 'mistral') {
-      return this.converseOpenAiDialect(this.mistralClient!, params);
+    if (provider === 'mistral') {
+      return this.converseOpenAiDialect(this.ensureMistral(), params);
     }
-    if (this.agentProvider === 'openai') {
-      return this.converseOpenAiDialect(this.openaiClient!, params);
+    if (provider === 'openai') {
+      return this.converseOpenAiDialect(this.ensureOpenAi(), params);
     }
 
     // Sonnet 4.6 accepts adaptive thinking and `output_config.effort`, but
@@ -236,7 +274,9 @@ export class LlmClient {
       max_tokens: params.maxTokens,
       system: params.system,
       messages: params.messages,
-      tools: params.tools,
+      // Omit entirely when empty — a forced final-answer turn passes no tools,
+      // and some providers reject an empty `tools` array.
+      ...(params.tools.length ? { tools: params.tools } : {}),
       ...(params.toolChoice ? { tool_choice: params.toolChoice } : {}),
       ...(adaptive
         ? params.thinking
@@ -248,7 +288,7 @@ export class LlmClient {
         : {}),
     };
 
-    const response = await this.anthropicClient!.messages.create(
+    const response = await this.ensureAnthropic().messages.create(
       body as unknown as Anthropic.MessageCreateParamsNonStreaming,
     );
 
@@ -283,7 +323,11 @@ export class LlmClient {
         model: params.model,
         max_tokens: params.maxTokens,
         messages: toMistralMessages(params.system, params.messages),
-        tools: params.tools.map(toMistralTool),
+        // Omit when empty — OpenAI/Mistral reject an empty `tools` array, and
+        // the forced final-answer turn deliberately passes none.
+        ...(params.tools.length
+          ? { tools: params.tools.map(toMistralTool) }
+          : {}),
         ...(params.toolChoice
           ? { tool_choice: toMistralToolChoice(params.toolChoice) }
           : {}),

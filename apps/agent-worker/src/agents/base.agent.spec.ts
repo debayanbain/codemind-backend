@@ -2,7 +2,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import type { LlmConverseParams } from '@app/common';
 import { EpochFencedError, noTokens } from '@app/common';
 import { BaseAgent, AgentContext } from './base.agent';
-import type { ToolContext } from '../tools/graph-tools';
+import type { ToolContext } from '@app/common';
 
 // A minimal agent whose emit schema is the docs one (small, easy to satisfy).
 class TestAgent extends BaseAgent {

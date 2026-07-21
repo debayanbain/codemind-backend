@@ -16,6 +16,8 @@ export * from './rabbitmq/rabbitmq-options.factory';
 export * from './rabbitmq/dead-letter-topology';
 export * from './codegraph/codegraph.service';
 export * from './codegraph/codegraph.module';
+export * from './codegraph/graph-tools';
+export * from './github/github-tarball.service';
 export * from './types/agent-outputs.types';
 export * from './types/diagram.types';
 export * from './types/token-usage.types';

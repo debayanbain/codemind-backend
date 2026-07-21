@@ -83,6 +83,9 @@ services:
     ports:
       - '${API_GATEWAY_PORT:-3000}:3000'
     volumes:
+      # Read the job's CodeGraph DB for repo chat — same shared volume the
+      # orchestrator writes and the agent-worker reads, re-opened read-only.
+      - codemind_repo_tmp:/tmp/repos
       - ./logs:/app/logs
     depends_on: *infra-healthy
 

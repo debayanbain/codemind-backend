@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRedis } from '@nestjs-modules/ioredis';
 import Redis from 'ioredis';
-import * as fs from 'fs/promises';
 
 import {
   PrismaService,
@@ -72,13 +71,11 @@ export class AgentFailureRecorderService {
     );
 
     if (doneCount >= expectedCount) {
-      // Close by path — the key openReadOnly used. See CodeGraphService.
+      // Close the write handle by path (the key openReadOnly used). The checkout
+      // + its CodeGraph are RETAINED on disk for the repo chat to re-open
+      // read-only; the orchestrator prunes the oldest checkouts on each new
+      // extraction so /tmp/repos stays bounded. See agent.consumer for detail.
       this.codeGraphService.close(repoPath);
-      await fs
-        .rm(repoPath, { recursive: true, force: true })
-        .catch((e: unknown) => {
-          this.logger.warn(`Failed to clean up ${repoPath}: ${String(e)}`);
-        });
       await this.redis.publish(jobReadyForSynthesisChannel(jobId), jobId);
       this.logger.log(
         `All agents done (via infra-failure path), synthesis triggered [job=${jobId}]`,

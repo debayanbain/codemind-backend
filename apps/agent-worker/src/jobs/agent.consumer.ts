@@ -357,17 +357,14 @@ export class AgentConsumer {
       );
 
       if (doneCount >= expectedCount) {
-        // Close by path, not jobId — the same key openReadOnly used, so a
-        // superseded run can never close the live run's handle.
+        // Close the write handle by path (not jobId — the same key openReadOnly
+        // used, so a superseded run can never close the live run's handle). The
+        // checkout + its CodeGraph SQLite are deliberately RETAINED on disk so
+        // the repo chat can re-open the graph read-only and reason over the real
+        // code after the job finishes. The orchestrator bounds /tmp/repos by
+        // pruning the oldest checkouts on each new extraction, so retention
+        // doesn't leak unboundedly.
         this.codeGraphService.close(repoPath);
-        // Last agent standing deletes the extracted repo + its CodeGraph
-        // SQLite DB (lives under repoPath/.codegraph) — otherwise every
-        // completed job leaks a full checkout on disk indefinitely.
-        await fs
-          .rm(repoPath, { recursive: true, force: true })
-          .catch((e: unknown) => {
-            this.logger.warn(`Failed to clean up ${repoPath}: ${String(e)}`);
-          });
         await this.redis.publish(jobReadyForSynthesisChannel(jobId), jobId);
         this.logger.log(`All agents done, synthesis triggered [job=${jobId}]`);
       }

@@ -52,6 +52,14 @@ export const jobRepoFactsKey = (runKey: string) => `job:${runKey}:repo_facts`;
 export const jobSubmitRateLimitKey = (userId: string) =>
   `ratelimit:job_submit:${userId}`;
 
+// Cached GitHub repo listing per user (the raw GraphQL nodes, before the live
+// per-repo job-status overlay). The GitHub GraphQL fetch is the slow part of
+// GET /repos and its result barely changes between page refreshes, so it's
+// cached with a short TTL; the job-status overlay is recomputed from Postgres on
+// every request so a just-finished analysis still shows immediately. Not in
+// Section 6's original table — an addition for dashboard responsiveness.
+export const userReposCacheKey = (userId: string) => `user:${userId}:repos`;
+
 // Phase 4 cost cap: cumulative input+output tokens spent on a job so far.
 // Checked by every agent-worker consumer *before* it calls the LLM, so once
 // the shared counter crosses JOB_TOKEN_BUDGET, agents still in the queue

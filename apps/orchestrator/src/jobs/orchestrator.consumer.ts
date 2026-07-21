@@ -17,7 +17,7 @@ import {
   jobRepoFactsKey,
 } from '@app/common';
 
-import { GithubTarballService } from '../github/github-tarball.service';
+import { GithubTarballService } from '@app/common';
 import { RepoManifestService } from '../manifest/repo-manifest.service';
 import { AgentDispatchService } from '../dispatch/agent-dispatch.service';
 import { JobFailureRecorderService } from './job-failure-recorder.service';

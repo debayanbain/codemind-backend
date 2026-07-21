@@ -18,7 +18,7 @@ import {
   ToolContext,
   describeToolUses,
   findTool,
-} from '../tools/graph-tools';
+} from '@app/common';
 
 export interface AgentContext {
   jobId: string;

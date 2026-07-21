@@ -62,6 +62,30 @@ const MAX_RELATED = 20;
 const MAX_CODE_CHARS = 6000;
 const MAX_FILE_CHARS = 8000;
 const MAX_LIST_FILES = 100;
+// search_text bounds — enough to answer "where is X used?" without walking a
+// huge tree unbounded.
+const MAX_TEXT_HITS = 40;
+const MAX_TEXT_FILES = 2000;
+const SKIP_DIRS = new Set([
+  '.git',
+  'node_modules',
+  '.codegraph',
+  'dist',
+  'build',
+  '.next',
+  'out',
+  'coverage',
+  '.turbo',
+  'vendor',
+  '.cache',
+]);
+const TEXT_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.go', '.rb', '.java', '.rs',
+  '.json', '.md', '.mdx', '.css', '.scss',
+  '.html', '.astro', '.vue', '.svelte',
+  '.yml', '.yaml', '.toml', '.env', '.txt', '.sh',
+]);
 
 const str = (v: unknown, name: string): string => {
   if (typeof v !== 'string' || !v.trim())
@@ -319,6 +343,102 @@ const readFile: AgentTool = {
   },
 };
 
+const searchText: AgentTool = {
+  def: {
+    name: 'search_text',
+    description:
+      'Grep the repository source for a literal string or regex, returning matching ' +
+      '`file:line: <line>` hits. Use this to answer "where is X used?" — a library ' +
+      'import (e.g. "framer-motion"), a hook, an env var, a route string — anything ' +
+      'that lives in the text but is not a named symbol search_nodes would find.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Text or regex to find, e.g. "framer-motion" or "useEffect\\(".',
+        },
+        path_prefix: {
+          type: 'string',
+          description: 'Optional repo-relative prefix to limit the search, e.g. "src".',
+        },
+        regex: {
+          type: 'boolean',
+          description: 'Treat query as a JavaScript regex (default false = literal).',
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  async run(input, ctx) {
+    const query = str(input.query, 'query');
+    const prefix =
+      typeof input.path_prefix === 'string' ? input.path_prefix : '';
+    let matcher: RegExp;
+    try {
+      matcher =
+        input.regex === true
+          ? new RegExp(query, 'i')
+          : new RegExp(escapeRegExp(query), 'i');
+    } catch {
+      throw new Error(`Invalid regex: ${query}`);
+    }
+
+    const root = path.resolve(ctx.repoPath);
+    const hits: string[] = [];
+    let filesScanned = 0;
+
+    const walk = async (dir: string): Promise<void> => {
+      if (hits.length >= MAX_TEXT_HITS || filesScanned >= MAX_TEXT_FILES) return;
+      let entries: import('fs').Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (hits.length >= MAX_TEXT_HITS || filesScanned >= MAX_TEXT_FILES)
+          return;
+        if (SKIP_DIRS.has(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full);
+        } else if (entry.isFile() && isTextFile(entry.name)) {
+          filesScanned++;
+          let content: string;
+          try {
+            content = await fs.readFile(full, 'utf-8');
+          } catch {
+            continue;
+          }
+          const rel = path.relative(root, full);
+          const lines = content.split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            if (matcher.test(lines[i])) {
+              hits.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+              if (hits.length >= MAX_TEXT_HITS) break;
+            }
+          }
+        }
+      }
+    };
+
+    const start = prefix ? resolveInside(ctx.repoPath, prefix) : root;
+    await walk(start);
+
+    if (!hits.length) {
+      return `No matches for ${query}${prefix ? ` under "${prefix}"` : ''}.`;
+    }
+    const capped =
+      hits.length >= MAX_TEXT_HITS ? `\n… (showing first ${MAX_TEXT_HITS})` : '';
+    return hits.join('\n') + capped;
+  },
+  describe(input) {
+    return `searching code for ${quoted(input.query)}`;
+  },
+};
+
 export const GRAPH_TOOLS: readonly AgentTool[] = [
   searchNodes,
   getCode,
@@ -328,6 +448,7 @@ export const GRAPH_TOOLS: readonly AgentTool[] = [
   getFileDependencies,
   listFiles,
   readFile,
+  searchText,
 ];
 
 export const GRAPH_TOOL_DEFS: readonly Anthropic.Tool[] = GRAPH_TOOLS.map(
@@ -364,6 +485,18 @@ function truncate(s: string, max: number): string {
   return s.length <= max
     ? s
     : `${s.slice(0, max)}\n... [truncated at ${max} chars]`;
+}
+
+/** Escape a literal string so it can be used as a RegExp source. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Only grep files we can reasonably treat as source/text. */
+function isTextFile(name: string): boolean {
+  const dot = name.lastIndexOf('.');
+  if (dot < 0) return false;
+  return TEXT_EXTENSIONS.has(name.slice(dot).toLowerCase());
 }
 
 // ── describe() helpers ──────────────────────────────────────────────────────
