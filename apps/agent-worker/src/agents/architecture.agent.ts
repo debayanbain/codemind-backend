@@ -13,16 +13,18 @@ export class ArchitectureAgent extends BaseAgent {
     'moduleEdges',
     'routes',
     'cycles',
+    'entryPoints',
+    'callChains',
   ] as const;
 
   // Architecture drives the whole report's structural picture, so give it more
   // output room than the other agents.
-  readonly maxOutputTokens = 3500;
+  readonly maxOutputTokens = 5000;
 
   // It also has genuinely more ground to cover: it walks module by module and
   // traces flows end to end. Eight turns is enough to look at auth; it is not
   // enough to explain a twelve-module system.
-  readonly maxTurns = 16;
+  readonly maxTurns = 20;
 
   readonly rolePrompt = `Your brief: produce the architecture map a new engineer would
 read on day one to understand how this repository is wired together end to end.
@@ -36,10 +38,14 @@ Your job is everything the skeleton cannot say:
   Read enough of each module to say something true and specific. "Handles utilities"
   is a non-answer; "Encrypts GitHub tokens at rest and builds the AMQP/Redis client
   options every service shares" is an answer. Cover every module in the skeleton.
-- request_flows: the 2-3 most important end-to-end paths. steps must be REAL symbol
-  names in call order (5-8 of them), traced with search_nodes + get_callees, from
-  trigger to response or side-effect. If you cannot trace a real flow, return []
-  rather than inventing a plausible one.
+- request_flows: the 2-3 most important end-to-end paths. The Ground Truth already
+  contains measured call chains — every hop in those is a real \`calls\` edge, and
+  the report DRAWS THE DIAGRAMS FROM THOSE, not from your steps. So name and explain
+  the flows: give each a \`name\` a reader recognises ("Analyse a repository", not
+  "handleRequest") and a \`description\` saying what it accomplishes and what it
+  touches. Put the chain's symbols in \`steps\` so the two can be matched up. If a
+  flow you want to describe is not in the measured chains, trace it with search_nodes
+  + get_callees first; if you cannot trace it, leave it out rather than inventing it.
 - architecture_pattern and design_patterns: what is actually here, evidenced. Do not
   list "Repository" because the language usually has one — point at the code.
 - summary: 3-6 sentences on the layers, how they collaborate, and the structural

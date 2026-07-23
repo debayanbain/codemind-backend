@@ -119,6 +119,13 @@ model Report {
   // structurally so the dashboard reads numbers instead of scraping prose.
   // Nullable: reports written before this column exist without it.
   synthesis       Json?
+  // RepoFacts — the AST ground truth this report was built on. Persisted so the
+  // dashboard renders the same measured numbers the Markdown does; without it
+  // the web view fell back to the agents' guessed hotspots while the .md showed
+  // the measured ones, making the richer surface the less trustworthy one.
+  // Nullable: the facts can also legitimately be absent when a run's Redis entry
+  // aged out before synthesis.
+  facts           Json?
   totalTokens     Int      @default(0) @map("total_tokens")
   createdAt       DateTime @default(now()) @map("created_at")
 

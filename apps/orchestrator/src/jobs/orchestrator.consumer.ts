@@ -109,6 +109,26 @@ export class OrchestratorConsumer {
     try {
       await this.markRunning(jobId);
 
+      // Ack NOW, before the download + index — not after dispatch.
+      //
+      // CodeGraph.indexAll() on a large repo is ~6 minutes of synchronous work
+      // that blocks the event loop solid. amqplib can't service its socket while
+      // blocked, so the broker's consumer channel dies mid-index (TCP-level —
+      // raising the heartbeat delays it but doesn't prevent it). Acking after the
+      // index therefore throws "Channel closed", RabbitMQ requeues the still-
+      // unacked message, and the whole 6-minute download+index+dispatch runs
+      // again — three times — burning agent tokens on every pass before it
+      // dead-letters.
+      //
+      // Acking up front settles the message while the channel is still alive, so
+      // a dead channel after the index costs nothing. The safety we give up is
+      // RabbitMQ redelivery if this process crashes mid-index; that's covered at
+      // the app layer instead — a genuine failure is recorded by
+      // `failureRecorder.markFailed` below (not by nack→DLQ), and a hard crash
+      // leaves a `running` job the user can retry. For a 6-minute blocking task,
+      // "ack on receipt, track state in the DB" is the correct pattern.
+      channel.ack(originalMsg);
+
       const user = await this.prisma.user.findUniqueOrThrow({
         where: { id: userId },
       });
@@ -159,7 +179,7 @@ export class OrchestratorConsumer {
           jobId,
           'No supported source files (JS, TS, Python, or Go) found to analyze in this repository.',
         );
-        channel.ack(originalMsg);
+        // Already acked up front — just record the failure and stop.
         return;
       }
 
@@ -202,21 +222,20 @@ export class OrchestratorConsumer {
       this.logger.log(
         `Dispatched ${agentTypes.length} agent(s) for job=${jobId}: ${agentTypes.join(', ')}`,
       );
-      channel.ack(originalMsg);
+      // Message was already acked up front — dispatch is done, nothing to settle.
     } catch (err: unknown) {
       const error = err instanceof Error ? err : new Error(String(err));
       this.logger.error(
         `Failed to process job=${jobId}: ${error.message}`,
         error.stack,
       );
-      await this.failureRecorder.markFailed(
-        jobId,
-        // Surface the real reason (capped in the recorder) so a failure is
-        // diagnosable, instead of a blanket "Analysis failed".
-        error.message,
-      );
-      // Don't requeue — a failed download/index won't succeed on redelivery without intervention.
-      channel.nack(originalMsg, false, false);
+      // The message is already acked, so a failure is recorded in durable state
+      // rather than redelivered. A download 404, an over-limit repo, or an index
+      // crash all end here — the job goes to `failed` with the real reason, and
+      // the user retries from the UI. No nack: the channel may well be dead by
+      // now (see the ack-up-front note), and nacking a settled message on a dead
+      // channel is exactly the throw this restructure removes.
+      await this.failureRecorder.markFailed(jobId, error.message);
     }
   }
 

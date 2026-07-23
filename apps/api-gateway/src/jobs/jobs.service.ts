@@ -13,6 +13,7 @@ import {
   Job,
   Report,
   RenderedDiagram,
+  RepoFacts,
   SonnetSynthesisOutput,
   AgentType,
   TokenUsage,
@@ -85,6 +86,18 @@ export interface ReportPayload {
   estimatedCostLabel: string;
   /** The model the figure above prices. */
   model: string;
+  /**
+   * The AST ground truth this report was built on.
+   *
+   * Served so the dashboard shows the same measured module table, routes and
+   * complexity hotspots the Markdown does. Without it the web view rendered the
+   * agents' *guessed* hotspots while the `.md` rendered the measured ones — the
+   * richer surface was the less trustworthy one.
+   *
+   * Null for reports written before the column existed, and for runs whose facts
+   * aged out of Redis before synthesis.
+   */
+  facts: RepoFacts | null;
 }
 
 export interface JobWithReport extends Job {
@@ -384,5 +397,6 @@ export function toReportPayload(report: Report): ReportPayload {
     estimatedCostUsd: usd,
     estimatedCostLabel: formatUsd(usd),
     model,
+    facts: (report.facts ?? null) as RepoFacts | null,
   };
 }

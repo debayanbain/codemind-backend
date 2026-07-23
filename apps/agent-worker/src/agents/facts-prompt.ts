@@ -18,7 +18,11 @@ export type FactSection =
   | 'routes'
   | 'hotspots'
   | 'cycles'
-  | 'deadCode';
+  | 'deadCode'
+  | 'entryPoints'
+  | 'dependencies'
+  | 'callChains'
+  | 'externalImports';
 
 const MAX_LINE_ITEMS = 20;
 
@@ -129,5 +133,52 @@ const RENDERERS: Record<FactSection, (f: RepoFacts) => string> = {
     return ['### Unreferenced symbols (possible dead code)', ...rows, ''].join(
       '\n',
     );
+  },
+
+  entryPoints: (f) => {
+    if (!f.entryPoints.length) return '';
+    const rows = f.entryPoints.map((e) => `- [${e.kind}] ${e.name} — ${e.detail}`);
+    return ['### Entry points and run commands', ...rows, ''].join('\n');
+  },
+
+  dependencies: (f) => {
+    if (!f.dependencies.length) return '';
+    const runtime = f.dependencies.filter((d) => d.scope === 'runtime');
+    const dev = f.dependencies.filter((d) => d.scope === 'dev');
+    const fmt = (list: typeof f.dependencies): string =>
+      list.map((d) => `${d.name}@${d.version}`).join(', ') || 'none';
+    return [
+      '### Declared dependencies (parsed from the manifest — exact, with versions)',
+      `- Runtime (${runtime.length}): ${fmt(runtime)}`,
+      `- Dev (${dev.length}): ${fmt(dev)}`,
+      'Use these names and versions verbatim. Do not recall a package that is not listed here.',
+      '',
+    ].join('\n');
+  },
+
+  callChains: (f) => {
+    if (!f.callChains.length) return '';
+    const rows = f.callChains.map(
+      (c) =>
+        `- ${c.name}: ${c.steps.map((s) => `${s.symbol} (${s.file}:${s.line})`).join(' -> ')}`,
+    );
+    return [
+      '### Measured call chains (every hop is a real `calls` edge in the graph)',
+      ...rows,
+      'These are traced paths, not summaries. Explain what they DO; do not restate them.',
+      '',
+    ].join('\n');
+  },
+
+  externalImports: (f) => {
+    if (!f.externalImports.length) return '';
+    const rows = f.externalImports
+      .slice(0, MAX_LINE_ITEMS)
+      .map((e) => `- ${e.module} -> ${e.package} (${e.count} imports)`);
+    return [
+      '### Which modules import which third-party packages (measured)',
+      ...rows,
+      '',
+    ].join('\n');
   },
 };

@@ -7,7 +7,12 @@ export class DocsAgent extends BaseAgent {
 
   // Public surface per module + real routes: what a newcomer would need
   // documented, grounded in what actually exists.
-  readonly factSections = ['overview', 'modules', 'routes'] as const;
+  readonly factSections = [
+    'overview',
+    'modules',
+    'routes',
+    'entryPoints',
+  ] as const;
 
   readonly rolePrompt = `Your brief: you are a technical writer judging whether this project
 is approachable to someone who has just been handed it.
@@ -21,9 +26,11 @@ What to investigate:
 - Sample the real public surface. Use get_code on a few exported symbols and see
   whether they carry doc comments. Do not estimate comment density from vibes;
   read some code and say what you saw.
-- Cross-check the README against reality. A README that documents a setup step that
-  no longer exists, or omits a service that does, is worse than a short one — that
-  is the most valuable thing you can find here, so look for it.
+- Cross-check the README against reality. The Ground Truth lists the real run
+  commands and entry points — compare them against what the README claims. A README
+  that documents a setup step that no longer exists, or omits a service that does, is
+  worse than a short one, and that mismatch is the most valuable thing you can find
+  here. Look for it specifically.
 
 doc_score is 0-100 and should track how fast a competent newcomer gets to a running
 system, not how many words the docs contain.`;

@@ -86,6 +86,74 @@ export interface DeadCodeFact {
   kind: string;
 }
 
+/** One hop of a measured call chain. Every field comes from a graph node. */
+export interface CallStepFact {
+  symbol: string;
+  file: string;
+  line: number;
+}
+
+/**
+ * A real end-to-end path through the code, walked with `getCallees` from a route
+ * handler or entry symbol.
+ *
+ * This exists because `request_flows[].steps` was a list of strings a model
+ * wrote. It produced sequence diagrams containing edges that are not calls —
+ * `setAgentStatus -> getJob` in the reference report is not an edge in the
+ * graph, it is two symbols the model listed in a row. A chain here can only
+ * contain hops the graph has.
+ */
+export interface CallChainFact {
+  /** The entry symbol the walk started from — names the flow. */
+  name: string;
+  entryFile: string;
+  steps: CallStepFact[];
+}
+
+/**
+ * A third-party package imported by one of this repo's modules.
+ *
+ * `getFileDependencies` deliberately returns only paths that resolve to indexed
+ * files, so external packages are invisible to it. They come from `import`
+ * nodes instead, which is what turns the dependency diagram from a grid of
+ * names into a graph with real edges.
+ */
+export interface ExternalImportFact {
+  /** Top-level source directory doing the importing. */
+  module: string;
+  /** Bare package name (`@scope/name` kept whole, subpaths stripped). */
+  package: string;
+  /** How many import statements this edge aggregates. */
+  count: number;
+}
+
+/** A declared dependency, transcribed from the manifest rather than recalled. */
+export interface DependencyFact {
+  name: string;
+  version: string;
+  scope: 'runtime' | 'dev';
+}
+
+/**
+ * Somewhere a reader can start. Script entries answer "how do I run this";
+ * symbol entries answer "what does the framework call first".
+ */
+export interface EntryPointFact {
+  kind: 'script' | 'main' | 'bin' | 'route' | 'component';
+  /** Script name / symbol name. */
+  name: string;
+  /** Command line for scripts; `file:line` context for symbols. */
+  detail: string;
+  file?: string;
+  line?: number;
+}
+
+/** Biggest indexed files by line count — where the mass of the repo actually is. */
+export interface LargestFileFact {
+  path: string;
+  linesOfCode: number;
+}
+
 export interface RepoFacts {
   /** `{jobId}-{epoch}` — the run these facts describe. */
   runKey: string;
@@ -105,6 +173,18 @@ export interface RepoFacts {
   /** Real findings the pipeline never surfaced before. */
   circularDependencies: string[][];
   deadCode: DeadCodeFact[];
+  /** Measured call paths. Replaces the architecture agent's guessed flow steps. */
+  callChains: CallChainFact[];
+  /** module -> third-party package edges. Makes the dependency diagram a graph. */
+  externalImports: ExternalImportFact[];
+  /** Declared dependencies with versions, straight from the manifest. */
+  dependencies: DependencyFact[];
+  /** Where to start reading, and how to run it. */
+  entryPoints: EntryPointFact[];
+  /** Test-file count, doc-file count and the heaviest files. */
+  testFiles: number;
+  docFiles: number;
+  largestFiles: LargestFileFact[];
   /** Set when a fact could not be computed — surfaced, never silently empty. */
   degraded: string[];
 }

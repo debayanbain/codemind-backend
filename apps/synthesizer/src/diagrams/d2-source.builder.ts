@@ -3,8 +3,26 @@ import {
   ArchitectureOutput,
   SecurityOutput,
   DependencyOutput,
+  CallChainFact,
+  ExternalImportFact,
 } from '@app/common';
 import { NodeStyle, PALETTE } from './palette';
+
+/**
+ * How many nodes a D2 source declares.
+ *
+ * Used to drop degenerate diagrams before they are rendered. A two-box
+ * "authentication flow" is not a small diagram, it is a missing one wearing a
+ * diagram's clothes — it tells the reader the analysis is complete when it
+ * isn't. Better to fall back to the table.
+ *
+ * The regex matches exactly what `node()` emits (`id: "label"`, optionally
+ * followed by a style block) and nothing else: `style.fill: "…"` has a dot,
+ * `direction: right` has no quote, and edges have a space before the colon.
+ */
+export function countNodes(source: string): number {
+  return (source.match(/^[ \t]*[A-Za-z_][A-Za-z0-9_]*:[ \t]*"/gm) ?? []).length;
+}
 
 /**
  * Agent JSON -> D2 source. Pure TypeScript, zero LLM calls.
@@ -25,6 +43,77 @@ export class D2SourceBuilder {
   private static readonly MAX_STEPS = 8;
   private static readonly MAX_VULNS = 4;
   private static readonly MAX_LABEL = 48;
+  /** System-flow caps — this diagram's whole value is that it fits on one line. */
+  private static readonly MAX_FLOW_STEPS = 6;
+  private static readonly MAX_FLOW_DEPS = 3;
+  /** Dependency-graph caps once it has real edges to draw. */
+  private static readonly MAX_DEP_MODULES = 6;
+  private static readonly MAX_DEP_PACKAGES = 12;
+  private static readonly MAX_DEP_EDGES = 18;
+
+  // ─── 0. System flow (measured) ─────────────────────────────────────────────
+
+  /**
+   * The end-to-end spine: entry → the symbols a request actually passes through
+   * → the third-party packages it lands on.
+   *
+   * Built entirely from `RepoFacts`. Every hop is a `calls` edge the graph has,
+   * and every package edge is an `import` node — so unlike every other flow
+   * diagram this report has drawn, none of it can be an edge that doesn't exist.
+   *
+   * Each node is labelled `module › symbol`, so the reader sees where the path
+   * crosses a module boundary, which is the part worth seeing.
+   */
+  systemFlow(
+    chains: CallChainFact[],
+    externalImports: ExternalImportFact[],
+  ): string {
+    const chain = [...chains].sort((a, b) => b.steps.length - a.steps.length)[0];
+    if (!chain || chain.steps.length < 2) {
+      return this.placeholder('No end-to-end call path measured');
+    }
+
+    const steps = chain.steps.slice(0, D2SourceBuilder.MAX_FLOW_STEPS);
+    const ids = new IdAllocator('s');
+    const lines = ['direction: right'];
+
+    steps.forEach((step, i) => {
+      const module = moduleOf(step.file);
+      const key = `${module}/${step.symbol}#${i}`;
+      lines.push(
+        this.node(
+          ids.get(key),
+          `${module} › ${step.symbol}`,
+          i === 0 ? PALETTE.entry : undefined,
+        ),
+      );
+      if (i > 0) {
+        lines.push(
+          this.edge(ids.get(`${moduleOf(steps[i - 1].file)}/${steps[i - 1].symbol}#${i - 1}`), ids.get(key), `${i}`),
+        );
+      }
+    });
+
+    // What the far end of the path reaches for. Scoped to the modules the chain
+    // actually touches — the top packages repo-wide would be a different, less
+    // honest claim.
+    const touched = new Set(steps.map((s) => moduleOf(s.file)));
+    const reached = externalImports
+      .filter((e) => touched.has(e.module))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, D2SourceBuilder.MAX_FLOW_DEPS);
+
+    if (reached.length > 0) {
+      const lastKey = `${moduleOf(steps[steps.length - 1].file)}/${steps[steps.length - 1].symbol}#${steps.length - 1}`;
+      for (const dep of reached) {
+        const id = ids.get(`pkg:${dep.package}`);
+        lines.push(this.node(id, dep.package, PALETTE.muted));
+        lines.push(this.edge(ids.get(lastKey), id, 'uses'));
+      }
+    }
+
+    return lines.join('\n');
+  }
 
   // ─── 1. Module dependency graph (architecture agent) ───────────────────────
 
@@ -54,7 +143,14 @@ export class D2SourceBuilder {
     const ids = new IdAllocator('m');
     const lines = ['direction: right'];
 
-    for (const m of [...nodeSet].slice(0, D2SourceBuilder.MAX_MODULES)) {
+    // Declare the wiring roots first. Layout engines break ties on declaration
+    // order, so this is what makes the graph read as layers — entry modules on
+    // one side, the things they lean on downstream — instead of arbitrarily.
+    const ordered = [...nodeSet].sort(
+      (a, b) => Number(hasIncoming.has(a)) - Number(hasIncoming.has(b)),
+    );
+
+    for (const m of ordered.slice(0, D2SourceBuilder.MAX_MODULES)) {
       lines.push(
         this.node(
           ids.get(m),
@@ -76,7 +172,53 @@ export class D2SourceBuilder {
     return lines.join('\n');
   }
 
-  // ─── 2. Request flow (architecture agent) ──────────────────────────────────
+  // ─── 2. Request flow ───────────────────────────────────────────────────────
+
+  /**
+   * A sequence diagram whose arrows are real call edges.
+   *
+   * The string-based `sequenceDiagram` below draws whatever order the model
+   * listed its steps in, which is how the reference report ended up with
+   * `setAgentStatus -> getJob` — two symbols named in sequence, not a call. This
+   * takes a chain the graph traced, so every arrow is an edge that exists.
+   */
+  sequenceFromChain(chain: CallChainFact): string {
+    const steps = chain.steps.slice(0, D2SourceBuilder.MAX_STEPS);
+    if (steps.length < 2) {
+      return this.placeholder('Request flow not available');
+    }
+
+    const ids = new IdAllocator('p');
+    const lines = ['shape: sequence_diagram'];
+
+    // Key on file+symbol, not symbol alone: two different `handle` functions in
+    // two files are two participants, and merging them draws a self-call that
+    // isn't in the code.
+    const keyOf = (s: { symbol: string; file: string }): string =>
+      `${s.file}::${s.symbol}`;
+
+    const seen = new Set<string>();
+    for (const step of steps) {
+      const id = ids.get(keyOf(step));
+      if (seen.has(id)) continue;
+      seen.add(id);
+      lines.push(this.node(id, `${step.symbol} (${moduleOf(step.file)})`));
+    }
+
+    for (let i = 0; i < steps.length - 1; i++) {
+      lines.push(
+        this.edge(ids.get(keyOf(steps[i])), ids.get(keyOf(steps[i + 1])), `${i + 1}`),
+      );
+    }
+
+    const first = ids.get(keyOf(steps[0]));
+    const last = ids.get(keyOf(steps[steps.length - 1]));
+    if (first !== last) {
+      lines.push(`${last} -> ${first}: "returns" { style.stroke-dash: 3 }`);
+    }
+
+    return lines.join('\n');
+  }
 
   sequenceDiagram(steps: string[]): string {
     if (!steps || steps.length < 2) {
@@ -156,10 +298,21 @@ export class D2SourceBuilder {
 
   // ─── 4. Dependency graph (dependency agent) ────────────────────────────────
 
-  dependencyGraph(dep: DependencyOutput): string {
+  dependencyGraph(
+    dep: DependencyOutput,
+    externalImports: ExternalImportFact[] = [],
+  ): string {
     const runtime = dep.runtime_dependencies ?? [];
     const critical = new Set(dep.critical_deps ?? []);
     const outdated = new Set((dep.outdated_risks ?? []).map((r) => r.package));
+
+    // Real edges when we measured them. Before this, the "dependency graph" was
+    // a grid of package names with no edges at all — the one diagram in the
+    // report that wasn't a graph. `module -> package` edges come from import
+    // nodes, so each one is an import that exists, weighted by how many.
+    if (externalImports.length > 0) {
+      return this.dependencyEdgeGraph(externalImports, critical, outdated);
+    }
 
     if (runtime.length === 0) {
       return this.placeholder('Dependency info not available');
@@ -204,6 +357,77 @@ export class D2SourceBuilder {
 
     lines.push('}');
     lines.push(this.edge('app', 'deps'));
+
+    return lines.join('\n');
+  }
+
+  /**
+   * `module -> package`, weighted by import count.
+   *
+   * Keeping the busiest modules and the packages they reach (rather than the
+   * top packages overall) is what keeps this small AND connected: every package
+   * drawn has at least one edge into a module that is also drawn, so there are
+   * no floating nodes.
+   */
+  private dependencyEdgeGraph(
+    externalImports: ExternalImportFact[],
+    critical: Set<string>,
+    outdated: Set<string>,
+  ): string {
+    const byModule = new Map<string, number>();
+    for (const e of externalImports) {
+      byModule.set(e.module, (byModule.get(e.module) ?? 0) + e.count);
+    }
+    const modules = new Set(
+      [...byModule.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, D2SourceBuilder.MAX_DEP_MODULES)
+        .map(([m]) => m),
+    );
+
+    const edges = externalImports
+      .filter((e) => modules.has(e.module))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, D2SourceBuilder.MAX_DEP_EDGES);
+
+    const packages = [...new Set(edges.map((e) => e.package))].slice(
+      0,
+      D2SourceBuilder.MAX_DEP_PACKAGES,
+    );
+    const keptPackages = new Set(packages);
+
+    const ids = new IdAllocator('d');
+    const lines = ['direction: right'];
+
+    for (const m of modules) {
+      lines.push(this.node(ids.get(`mod:${m}`), m, PALETTE.root));
+    }
+
+    for (const pkg of packages) {
+      const isCritical = critical.has(pkg);
+      const isOutdated = outdated.has(pkg);
+
+      // Text prefix, not just fill — greyscale printouts and colourblind
+      // readers get the same information the colour carries.
+      const tags: string[] = [];
+      if (isCritical) tags.push('CRITICAL');
+      if (isOutdated) tags.push('OUTDATED');
+      const label = tags.length ? `[${tags.join(' + ')}] ${pkg}` : pkg;
+
+      let style: NodeStyle | undefined;
+      if (isCritical && isOutdated) style = PALETTE.critical;
+      else if (isCritical) style = PALETTE.entry;
+      else if (isOutdated) style = PALETTE.warning;
+
+      lines.push(this.node(ids.get(`pkg:${pkg}`), label, style));
+    }
+
+    for (const e of edges) {
+      if (!keptPackages.has(e.package)) continue;
+      lines.push(
+        this.edge(ids.get(`mod:${e.module}`), ids.get(`pkg:${e.package}`), `${e.count}`),
+      );
+    }
 
     return lines.join('\n');
   }
@@ -257,6 +481,12 @@ export class D2SourceBuilder {
   private placeholder(message: string): string {
     return this.node('empty', message, PALETTE.muted);
   }
+}
+
+/** Top-level directory of a repo-relative path — the module a symbol lives in. */
+function moduleOf(filePath: string): string {
+  const first = String(filePath ?? '').split('/')[0];
+  return first && first !== filePath ? first : '(root)';
 }
 
 /**

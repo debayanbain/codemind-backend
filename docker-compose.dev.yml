@@ -62,6 +62,10 @@ services:
       - '${RABBITMQ_MGMT_PORT:-15672}:15672'
     volumes:
       - codemind_dev_rabbitmq_data:/var/lib/rabbitmq
+      # Raises the server heartbeat to 900s. AMQP negotiates the lower of client
+      # and server, so this must match RABBITMQ_HEARTBEAT_SECONDS or a 6-minute
+      # CodeGraph index still drops the connection. See rabbitmq/rabbitmq.conf.
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
     healthcheck:
       # check_running + check_local_alarms reports healthy only once the broker
       # actually accepts AMQP connections — check_port_connectivity flips healthy

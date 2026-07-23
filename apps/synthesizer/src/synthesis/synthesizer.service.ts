@@ -27,7 +27,7 @@ import {
   totalTokens,
 } from '@app/common';
 import { DiagramsService } from '../diagrams/diagrams.service';
-import { ReportRenderer } from '../report/report-renderer.service';
+import { Finding, ReportRenderer } from '../report/report-renderer.service';
 
 const SONNET_MODEL =
   process.env.ANTHROPIC_SYNTHESIS_MODEL ?? 'claude-sonnet-4-6';
@@ -258,10 +258,22 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
       // job whose facts have aged out of Redis still renders, just without them.
       const facts = await this.loadFacts(jobId);
 
+      // Build the findings register BEFORE synthesis, not during rendering.
+      // Recommendations that cite `SEC-01` are only useful if `SEC-01` is the
+      // id the register actually assigns, and the only way to guarantee that is
+      // for both to read the same list.
+      const { findings, unanchored } = this.renderer.buildFindings(
+        byType.security,
+        byType.quality,
+        byType.dependency,
+      );
+
       // 2. ONE Sonnet call for executive summary + recommendations only.
       //    Agents already did the extraction — Sonnet does cross-agent reasoning.
-      const { synthesis, usage: synthesisUsage } =
-        await this.callSonnet(byType);
+      const { synthesis, usage: synthesisUsage } = await this.callSonnet(
+        byType,
+        findings,
+      );
 
       // 3. Build every diagram from structured agent JSON and render each to
       //    SVG — still ZERO LLM calls; D2 layout and the charts are pure code.
@@ -290,6 +302,22 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
         diagrams,
         synthesis,
         totalTokens: reportTotalTokens,
+        agentTokens,
+        synthesisTokens: totalTokens(synthesisUsage),
+        // The per-agent record has always been in Postgres and has never been
+        // shown. It is the direct evidence for "cost is measurable, not a
+        // promise", so the report now prints it.
+        agentRuns: results.map((r) => ({
+          agentType: r.agentType,
+          status: r.status,
+          tokens: r.tokensUsed
+            ? totalTokens(r.tokensUsed as unknown as TokenUsage)
+            : 0,
+          durationMs: r.durationMs,
+          error: r.error,
+        })),
+        findings,
+        unanchoredFindings: unanchored,
         facts,
       });
 
@@ -303,6 +331,11 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
           markdownContent: markdown,
           diagrams: diagrams as unknown as Prisma.InputJsonValue,
           synthesis: synthesis as unknown as Prisma.InputJsonValue,
+          // The same ground truth the Markdown quotes, so the dashboard shows
+          // measured numbers rather than the agents' guesses at them.
+          // `undefined` here means "leave the column alone", which is the right
+          // behaviour on an insert whose facts aged out of Redis.
+          facts: facts as unknown as Prisma.InputJsonValue | undefined,
           totalTokens: reportTotalTokens,
         },
       });
@@ -376,22 +409,38 @@ export class SynthesizerService implements OnModuleInit, OnModuleDestroy {
 
   private async callSonnet(
     byType: AgentOutputsByType,
+    findings: Finding[],
   ): Promise<{ synthesis: SonnetSynthesisOutput; usage: TokenUsage }> {
     const response = await this.client.complete({
       anthropicModel: SONNET_MODEL,
       openaiModel: OPENAI_SYNTHESIS_MODEL,
       mistralModel: MISTRAL_SYNTHESIS_MODEL,
-      maxTokens: 1400,
+      // Raised from 1400: the schema asks for a 5-8 sentence summary plus five
+      // recommendations that each name a problem and a fix, and at 1400 the
+      // recommendations were competing with the summary for the same envelope.
+      maxTokens: 3000,
       system: `You are a principal engineer writing the executive assessment at the top of a codebase intelligence report that a developer will actually read. Respond ONLY with valid JSON. No preamble, no markdown fences.
         Schema:
         {
           "executiveSummary": string,    // 5-8 sentences. Lead with what the system IS and its architecture, then weave in the cross-cutting findings — the most important security, quality, dependency, and documentation signals — and end with the overall risk posture. Reference concrete specifics from the agent outputs (frameworks, real modules, named vulnerabilities/issues). No filler, no generic praise.
-          "recommendations": string[],  // top 5 concrete, actionable recommendations ordered by priority (highest impact first). Each names the specific problem and the fix.
+          "recommendations": string[],  // top 5 concrete, actionable recommendations ordered by priority (highest impact first). Each names the specific problem and the fix, and CITES the finding ids it addresses in square brackets — e.g. "Add ownership checks to the export handler [SEC-01, SEC-03]." Only cite ids from the register you are given; a recommendation that addresses nothing in the register needs no citation.
           "overallHealthScore": number  // 0-100 codebase health score, justified by the findings below
         }`,
       user: `Here are structured outputs from specialized analysis agents for the same codebase.
 
           Synthesize them into one coherent assessment. Do not just restate each agent — connect findings across agents (e.g. a security gap that is worse because tests are absent). Ground every claim in the data below.
+
+          ## Findings Register (the ids your recommendations must cite)
+          ${
+            findings.length
+              ? findings
+                  .map(
+                    (f) =>
+                      `${f.id} [${f.severity}] ${f.area}: ${f.title} @ ${f.location} — ${f.detail}`,
+                  )
+                  .join('\n          ')
+              : 'No locatable findings were reported.'
+          }
 
           ## Architecture Agent Output
           ${JSON.stringify(byType.architecture ?? {}, null, 2)}

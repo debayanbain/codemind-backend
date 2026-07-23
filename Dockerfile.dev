@@ -30,4 +30,12 @@ COPY . .
 
 # APP_NAME is set at container runtime (docker-compose.dev.yml), not build
 # time — one image, started 4 different ways.
-CMD ["sh", "-c", "npx nest start ${APP_NAME} --watch"]
+#
+# `prisma generate` runs on every boot, before the watch, on purpose. The
+# generated client lives in the anonymous `node_modules` volume, which survives
+# restarts and is baked once at image build — so a schema change on the
+# bind-mounted source leaves the client stale, the `nest --watch` compile fails
+# on the missing field, and the app never starts (it just sits, and any queued
+# work sits with it). Regenerating here against the mounted schema makes a plain
+# `docker restart` enough to pick up a schema change, with no manual step.
+CMD ["sh", "-c", "npx prisma generate && npx nest start ${APP_NAME} --watch"]

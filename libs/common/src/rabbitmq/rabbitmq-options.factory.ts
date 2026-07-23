@@ -25,8 +25,24 @@ import {
  * 30s (vs the server default of 60) fails faster and more predictably, and the
  * tool loop yields via setImmediate between tool executions so the beats land.
  * Pinning it on the URL means every connection in every service agrees.
+ *
+ * **Env-tunable, and here is why it must be.** The agent loop yields, so 30s is
+ * right for it. But `CodeGraph.indexAll()` in the orchestrator is a single
+ * ~6-minute *synchronous* block on a large repo (5000+ files) — library code we
+ * cannot sprinkle `breathe()` into. It sails past any 30s heartbeat, the broker
+ * drops the connection mid-index, dispatch never fires, and the job hangs at
+ * "running" until it dead-letters. Raising this (and the matching server value —
+ * AMQP negotiates the LOWER of the two, so the client alone is not enough) lets
+ * a long index finish. The cost is slower liveness detection, which in a
+ * background indexer is an acceptable trade for actually completing.
  */
-const HEARTBEAT_SECONDS = 30;
+const DEFAULT_HEARTBEAT_SECONDS = 30;
+
+/** Read the heartbeat once, from env, so every service in the process agrees. */
+function heartbeatSeconds(): number {
+  const raw = Number(process.env.RABBITMQ_HEARTBEAT_SECONDS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_HEARTBEAT_SECONDS;
+}
 
 function rabbitmqUrl(config: ConfigService): string {
   const base = config.get<string>(
@@ -39,7 +55,7 @@ function rabbitmqUrl(config: ConfigService): string {
 /** Add `heartbeat` to an AMQP URL unless it already specifies one. */
 export function withHeartbeat(url: string): string {
   if (/[?&]heartbeat=/.test(url)) return url;
-  return `${url}${url.includes('?') ? '&' : '?'}heartbeat=${HEARTBEAT_SECONDS}`;
+  return `${url}${url.includes('?') ? '&' : '?'}heartbeat=${heartbeatSeconds()}`;
 }
 
 /**

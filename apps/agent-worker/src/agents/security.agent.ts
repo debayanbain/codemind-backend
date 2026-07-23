@@ -7,7 +7,13 @@ export class SecurityAgent extends BaseAgent {
 
   // Real routes are the security agent's most valuable input: an audit of the
   // endpoints that exist beats an audit of endpoints it imagined.
-  readonly factSections = ['overview', 'routes', 'modules'] as const;
+  readonly factSections = [
+    'overview',
+    'routes',
+    'modules',
+    'entryPoints',
+    'callChains',
+  ] as const;
 
   readonly rolePrompt = `Your brief: you are a security engineer auditing this codebase.
 The routes in the Ground Truth are the real, complete attack surface — audit those,
@@ -29,6 +35,11 @@ What to investigate:
   concatenates untrusted input. A parameterised query is not a finding.
 
 Rules that matter:
+- **sensitive_endpoints must come from the route list in the Ground Truth**, verbatim,
+  path for path. The report renders the real route table and drops anything you name
+  that is not in it — an endpoint a project like this "usually has" is not a finding,
+  it is noise that discredits the findings next to it. If the route list is empty,
+  return an empty array.
 - **Do not invent vulnerabilities.** An empty vulnerabilities list from a genuine
   audit is a valid, useful result. A plausible-sounding CVE you did not verify is
   worse than nothing — it destroys trust in every other finding in the report.

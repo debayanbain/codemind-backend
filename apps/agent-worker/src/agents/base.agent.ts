@@ -61,10 +61,17 @@ export interface AgentResult {
 // one the report prices and displays — no drift between what ran and what's billed.
 const AGENT_EFFORT = (process.env.ANTHROPIC_AGENT_EFFORT ?? 'medium') as
   'low' | 'medium' | 'high' | 'max';
-/** Seed-message ceiling. The loop grows past this by design; this bounds turn 1. */
-const MAX_INPUT_TOKENS = 12_000;
+/**
+ * Seed-message ceiling. The loop grows past this by design; this bounds turn 1.
+ *
+ * Raised from 12k with the widened RepoFacts pre-pass: the facts block now
+ * carries entry points, declared dependencies with versions, and measured call
+ * chains, and at the old ceiling `holdUnderBudget` was truncating the ground
+ * truth away — spending the pre-pass and then throwing it out.
+ */
+const MAX_INPUT_TOKENS = 20_000;
 /** Per-agent default ceiling on total tokens processed. */
-const DEFAULT_AGENT_TOKEN_BUDGET = 120_000;
+const DEFAULT_AGENT_TOKEN_BUDGET = 200_000;
 /** Held back so the forced final emit can always afford to run. */
 const RESERVE_TOKENS = 8_000;
 
@@ -144,7 +151,7 @@ export abstract class BaseAgent {
    * the default; architecture asks for a fuller structural map and overrides
    * this upward. Kept modest — output tokens count against the job budget.
    */
-  protected readonly maxOutputTokens: number = 2500;
+  protected readonly maxOutputTokens: number = 3500;
 
   /**
    * Which slices of the AST ground truth this agent is shown. Each agent takes
@@ -157,8 +164,12 @@ export abstract class BaseAgent {
    * How many evidence-gathering turns this agent gets before the emit tool is
    * forced. Architecture overrides upward: it walks module by module, so it has
    * genuinely more ground to cover than "is there a README".
+   *
+   * Raised from 8. Four of five agents were hitting this cap and finishing
+   * early, and the report said so in its own footer — the thin sections were
+   * thin because the loop stopped, not because the code was simple.
    */
-  protected readonly maxTurns: number = 8;
+  protected readonly maxTurns: number = 14;
 
   /**
    * A bounded evidence loop.

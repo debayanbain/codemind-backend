@@ -1,4 +1,4 @@
-import { D2SourceBuilder } from './d2-source.builder';
+import { D2SourceBuilder, countNodes } from './d2-source.builder';
 
 describe('D2SourceBuilder', () => {
   const builder = new D2SourceBuilder();
@@ -175,6 +175,120 @@ describe('D2SourceBuilder', () => {
 
     it('degrades when there is neither a flow nor a finding', () => {
       expect(builder.securityFlow({})).toContain('Auth flow not detected');
+    });
+  });
+
+  describe('countNodes', () => {
+    it('counts node declarations and nothing else', () => {
+      // This gates whether a diagram is drawn at all, so it must not count
+      // style properties, layout directives or edges as nodes.
+      const src = [
+        'direction: right',
+        'a: "A"',
+        'b: "B" {',
+        '  style.fill: "#000"',
+        '  style.stroke-width: 2',
+        '}',
+        'a -> b: "1"',
+        'grid-columns: 3',
+      ].join('\n');
+
+      expect(countNodes(src)).toBe(2);
+    });
+
+    it('scores a two-box flow below the drawing threshold', () => {
+      // The reference report shipped a two-box "Authentication Flow". Two boxes
+      // and an arrow is the absence of a finding, not a small one.
+      expect(
+        countNodes(builder.securityFlow({ auth_flow_steps: ['login', 'redirect'] })),
+      ).toBe(2);
+    });
+  });
+
+  describe('systemFlow', () => {
+    const chain = {
+      name: 'analyze',
+      entryFile: 'apps/api-gateway/src/jobs/analyze.controller.ts',
+      steps: [
+        {
+          symbol: 'analyze',
+          file: 'apps/api-gateway/src/jobs/analyze.controller.ts',
+          line: 26,
+        },
+        {
+          symbol: 'createAnalysisJob',
+          file: 'apps/api-gateway/src/jobs/jobs.service.ts',
+          line: 103,
+        },
+        { symbol: 'emit', file: 'libs/common/src/rabbitmq/client.ts', line: 8 },
+      ],
+    };
+
+    it('draws the measured path and the packages it reaches', () => {
+      const src = builder.systemFlow(
+        [chain],
+        [
+          { module: 'libs', package: 'amqplib', count: 4 },
+          { module: 'web', package: 'react', count: 90 },
+        ],
+      );
+
+      expect(src).toContain('apps › analyze');
+      expect(src).toContain('libs › emit');
+      // Scoped to the modules this path touches — `web` is not on it.
+      expect(src).toContain('amqplib');
+      expect(src).not.toContain('react');
+    });
+
+    it('degrades rather than drawing a path it did not measure', () => {
+      expect(builder.systemFlow([], [])).toContain(
+        'No end-to-end call path measured',
+      );
+    });
+  });
+
+  describe('sequenceFromChain', () => {
+    it('keeps same-named symbols in different files apart', () => {
+      // Merging them would draw a self-call that is not in the code.
+      const src = builder.sequenceFromChain({
+        name: 'handle',
+        entryFile: 'a/x.ts',
+        steps: [
+          { symbol: 'handle', file: 'a/x.ts', line: 1 },
+          { symbol: 'handle', file: 'b/y.ts', line: 2 },
+          { symbol: 'save', file: 'b/y.ts', line: 9 },
+        ],
+      });
+
+      expect(src).toContain('shape: sequence_diagram');
+      expect(countNodes(src)).toBe(3);
+    });
+  });
+
+  describe('dependencyGraph with measured imports', () => {
+    it('draws real module -> package edges instead of an edgeless grid', () => {
+      const src = builder.dependencyGraph(
+        { runtime_dependencies: ['react'], critical_deps: ['react'] },
+        [
+          { module: 'components', package: 'react', count: 37 },
+          { module: 'lib', package: 'zod', count: 3 },
+        ],
+      );
+
+      expect(src).toContain('-> ');
+      expect(src).toContain('"37"');
+      expect(src).toContain('[CRITICAL] react');
+    });
+
+    it('never leaves a package node without an edge into a drawn module', () => {
+      const src = builder.dependencyGraph({}, [
+        { module: 'a', package: 'p1', count: 5 },
+        { module: 'b', package: 'p2', count: 1 },
+      ]);
+
+      // Two modules, two packages, two edges — nothing floating.
+      expect(countNodes(src)).toBe(4);
+      expect((src.match(/->/g) ?? []).length).toBe(2);
     });
   });
 });
